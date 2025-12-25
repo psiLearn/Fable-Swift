@@ -1,10 +1,81 @@
 module Fable.Tests.Cli
 
+open System
+open Fable
 open Fable.Cli.Entry
+open Fable.Compiler.ProjectCracker
+open Fable.Compiler.Util
+open Fable.Transforms
 open Expecto
 
 type Result<'T1, 'T2> with
     member this.Value = match this with Ok v -> v | Error _ -> failwith "I'm Error!"
+
+let private makeCompiler language libraryDir =
+    let options = CompilerOptionsHelper.Make(language = language)
+
+    { new Compiler with
+        member _.LibraryDir = libraryDir
+        member _.CurrentFile = ""
+        member _.OutputDir = None
+        member _.OutputType = OutputType.Library
+        member _.ProjectFile = ""
+        member _.ProjectOptions = Unchecked.defaultof<_>
+        member _.SourceFiles = [||]
+        member _.Options = options
+        member _.Plugins = { MemberDeclarationPlugins = Map.empty }
+        member _.IncrementCounter() = 0
+        member _.IsPrecompilingInlineFunction = false
+        member this.WillPrecompileInlineFunction _ = this :> Compiler
+        member _.GetImplementationFile _ = failwith "Not implemented in test stub"
+        member _.GetRootModule _ = "", None
+        member _.TryGetEntity _ = None
+        member _.GetInlineExpr _ = Unchecked.defaultof<_>
+        member _.AddWatchDependency _ = ()
+        member _.AddLog(_msg, _severity, ?range, ?fileName, ?tag) = ()
+    }
+
+let private withTempProject language (testFn: CrackerOptions -> unit) =
+    let rootDir = IO.Path.Combine(IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"))
+    let projDir = IO.Path.Combine(rootDir, "proj")
+
+    IO.Directory.CreateDirectory(projDir) |> ignore
+
+    let projFile = IO.Path.Combine(projDir, "Test.fsproj")
+    IO.File.WriteAllText(projFile, "<Project></Project>")
+
+    let compilerOptions = CompilerOptionsHelper.Make(language = language)
+
+    let cliArgs =
+        {
+            ProjectFile = projFile
+            RootDir = projDir
+            OutDir = None
+            IsWatch = false
+            Precompile = false
+            PrecompiledLib = None
+            PrintAst = false
+            FableLibraryPath = None
+            Configuration = "Debug"
+            NoRestore = true
+            NoCache = true
+            NoParallelTypeCheck = false
+            SourceMaps = false
+            SourceMapsRoot = None
+            Exclude = []
+            Replace = Map.empty
+            RunProcess = None
+            CompilerOptions = compilerOptions
+            Verbosity = Verbosity.Normal
+        }
+
+    let opts = CrackerOptions(cliArgs, evaluateOnly = true)
+
+    try
+        testFn opts
+    finally
+        if IO.Directory.Exists(rootDir) then
+            IO.Directory.Delete(rootDir, true)
 
 let tests =
   testList "Cli" [
@@ -21,4 +92,33 @@ let tests =
     testCase "Cannot use --outir" <| fun () ->
         let res = parseCliArgs ["--outir"; "foo"]
         Expect.isError res "--outir args"
+
+    testCase "Can parse swift language" <| fun () ->
+        let res = parseCliArgs ["--lang"; "swift"]
+        Expect.isOk res "--lang swift args"
+        Expect.equal (argLanguage res.Value) (Ok Swift) "swift language"
+
+    testCase "Can parse swift alias" <| fun () ->
+        let res = parseCliArgs ["--lang"; "sw"]
+        Expect.isOk res "--lang sw args"
+        Expect.equal (argLanguage res.Value) (Ok Swift) "sw alias"
+
+    testCase "Default file extension for swift" <| fun () ->
+        Expect.equal (File.defaultFileExt false Swift) ".fs.swift" "swift extension without outDir"
+        Expect.equal (File.defaultFileExt true Swift) ".swift" "swift extension with outDir"
+
+    testCase "Swift library path uses .swift extension" <| fun () ->
+        let libraryDir = Path.normalizePath (IO.Path.Combine("temp", "fable-library-swift"))
+        let com = makeCompiler Swift libraryDir
+
+        Expect.equal (getLibPath com "Fable.Core") (libraryDir + "/Fable.Core.swift") "swift lib path"
+
+    testCase "Swift fable library path uses fable-library-swift" <| fun () ->
+        withTempProject Swift (fun opts ->
+            let expected =
+                IO.Path.Combine(opts.FableModulesDir, "fable-library-swift")
+                |> Path.normalizeFullPath
+
+            Expect.equal (getFableLibraryPath opts false) expected "swift fable library path"
+        )
   ]

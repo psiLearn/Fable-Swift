@@ -1142,6 +1142,7 @@ module AST =
         | TypeScript -> com.LibraryDir + "/" + moduleName + ".ts"
         | JavaScript -> com.LibraryDir + "/" + moduleName + ".js"
         | Php -> com.LibraryDir + "/" + moduleName + ".php"
+        | Swift -> com.LibraryDir + "/" + moduleName + ".swift"
 
     let makeImportUserGenerated r t (selector: string) (path: string) =
         Import(

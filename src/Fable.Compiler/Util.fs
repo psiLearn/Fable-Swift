@@ -131,6 +131,7 @@ module File =
             | Fable.Php -> ".php"
             | Fable.Dart -> ".dart"
             | Fable.Rust -> ".rs"
+            | Fable.Swift -> ".swift"
             | Fable.JavaScript -> ".js"
 
         match language, usesOutDir with

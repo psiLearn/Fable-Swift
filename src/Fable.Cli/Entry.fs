@@ -56,6 +56,48 @@ type CliArgs(args: string list) =
     member this.FlagEnabled([<ParamArray>] flags: string array) =
         flags |> Array.exists (fun flag -> this.FlagOr(flag, false))
 
+let private languageOptions =
+    [
+        "javascript", Some "js", JavaScript
+        "typescript", Some "ts", TypeScript
+        "python", Some "py", Python
+        "rust", Some "rs", Rust
+        "php", None, Php
+        "dart", None, Dart
+        "swift", Some "sw", Swift
+    ]
+
+let private languageHelpLines =
+    languageOptions
+    |> List.map (fun (name, alias, _) ->
+        match alias with
+        | Some alias -> $"  - {name} (alias {alias})"
+        | None -> $"  - {name}"
+    )
+
+let private languageHelpText =
+    [
+        "Available options:"
+        yield! languageHelpLines
+    ]
+
+let private languageMap =
+    languageOptions
+    |> List.collect (fun (name, alias, language) ->
+        match alias with
+        | Some alias -> [ name, language; alias, language ]
+        | None -> [ name, language ]
+    )
+    |> Map.ofList
+
+let private languageErrorMessage unknown =
+    [
+        $"'{unknown}' is not a valid language."
+        ""
+        yield! languageHelpText
+    ]
+    |> String.concat "\n"
+
 let knownCliArgs () =
     [
         [ "--cwd" ], [ "Working directory" ]
@@ -99,17 +141,11 @@ let knownCliArgs () =
         [
             "Choose wich languages to compile to"
             ""
-            "Available options:"
-            "  - javascript (alias js)"
-            "  - typescript (alias ts)"
-            "  - python (alias py)"
-            "  - rust (alias rs)"
-            "  - php"
-            "  - dart"
+            yield! languageHelpText
             ""
             "Default is javascript"
             ""
-            "Support for TypeScript, Python, Rust, Php and Dart is experimental."
+            "Support for TypeScript, Python, Rust, Php, Dart and Swift is experimental."
         ]
         [ "--legacyCracker" ],
         [
@@ -186,34 +222,11 @@ let parseCliArgs (args: string list) = CliArgs(args) |> sanitizeCliArgs
 let argLanguage (args: CliArgs) =
     args.Value("--lang", "--language")
     |> Option.map (fun lang ->
+        let normalized = lang.ToLowerInvariant()
 
-        match lang.ToLowerInvariant() with
-        | "js"
-        | "javascript" -> Ok JavaScript
-        | "ts"
-        | "typescript" -> Ok TypeScript
-        | "py"
-        | "python" -> Ok Python
-        | "php" -> Ok Php
-        | "dart" -> Ok Dart
-        | "rs"
-        | "rust" -> Ok Rust
-        | unknown ->
-            let errorMessage =
-                [
-                    $"'{unknown}' is not a valid language."
-                    ""
-                    "Available options:"
-                    "  - javascript (alias js)"
-                    "  - typescript (alias ts)"
-                    "  - python (alias py)"
-                    "  - rust (alias rs)"
-                    "  - php"
-                    "  - dart"
-                ]
-                |> String.concat "\n"
-
-            Error errorMessage
+        match Map.tryFind normalized languageMap with
+        | Some language -> Ok language
+        | None -> Error(languageErrorMessage normalized)
     )
     |> Option.defaultValue (Ok JavaScript)
 
@@ -323,6 +336,7 @@ type Runner =
                         | Python -> "FABLE_COMPILER_PYTHON"
                         | TypeScript -> "FABLE_COMPILER_TYPESCRIPT"
                         | JavaScript -> "FABLE_COMPILER_JAVASCRIPT"
+                        | Swift -> "FABLE_COMPILER_SWIFT"
                     ]
                 |> List.distinct
 
@@ -468,6 +482,7 @@ let getStatus =
     | Rust -> "alpha"
     | Dart -> "beta"
     | Php -> "experimental"
+    | Swift -> "experimental"
 
 let getLibPkgVersion =
     function
@@ -476,7 +491,8 @@ let getLibPkgVersion =
     | Python
     | Rust
     | Dart
-    | Php -> None
+    | Php
+    | Swift -> None
 
 let private logPrelude commands language =
     match commands with

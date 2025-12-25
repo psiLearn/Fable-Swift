@@ -502,6 +502,20 @@ module Rust =
                 do! RustPrinter.run writer crate
         }
 
+module Swift =
+    let private swiftNotImplemented () =
+        "Swift backend is not implemented yet. See docs/swift-backend-feasibility.md."
+        |> Fable.FableError
+
+    let compileFile
+        (_com: Compiler)
+        (_cliArgs: CliArgs)
+        (_pathResolver: PathResolver)
+        (_isSilent: bool)
+        (_outPath: string)
+        =
+        Async.FromContinuations(fun (_onSuccess, onError, _onCancel) -> onError (swiftNotImplemented ()))
+
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
     match com.Options.Language with
     | JavaScript
@@ -510,3 +524,4 @@ let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPat
     | Php -> Php.compileFile com cliArgs pathResolver isSilent outPath
     | Dart -> Dart.compileFile com cliArgs pathResolver isSilent outPath
     | Rust -> Rust.compileFile com cliArgs pathResolver isSilent outPath
+    | Swift -> Swift.compileFile com cliArgs pathResolver isSilent outPath

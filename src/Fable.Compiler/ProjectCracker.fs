@@ -663,11 +663,16 @@ let copyDirIfDoesNotExist replaceFsprojExt (source: string) (target: string) =
     if File.isDirectoryEmpty target then
         copyDir replaceFsprojExt source target
 
+let private fableLibrarySwiftDir = "fable-library-swift"
+
 let getFableLibraryPath (opts: CrackerOptions) (shouldCopy: bool) =
     let buildDir, libDir =
         match opts.FableOptions.Language, opts.FableLib with
         | Dart, None -> "fable-library-dart", "fable_library"
         | Rust, None -> "fable-library-rust", "fable-library-rust"
+        | Swift, None ->
+            let libDir = IO.Path.Combine(opts.FableModulesDir, fableLibrarySwiftDir)
+            "", Path.normalizeFullPath libDir
         | TypeScript, None -> "fable-library-ts", $"fable-library-ts.%s{Literals.VERSION}"
         | Php, None -> "fable-library-php", "fable-library-php"
         | JavaScript, None -> "fable-library-js", $"fable-library-js.%s{Literals.VERSION}"
