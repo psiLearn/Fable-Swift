@@ -73,3 +73,4 @@ type ProjectCrackerResolver =
         isMain: bool * options: CrackerOptions * projectFile: string -> ProjectOptionsResponse
 
 val getFullProjectOpts: resolver: ProjectCrackerResolver -> opts: CrackerOptions -> CrackerResponse
+val getFableLibraryPath: opts: CrackerOptions -> shouldCopy: bool -> string

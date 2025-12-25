@@ -20,17 +20,17 @@ let private makeCompiler language libraryDir =
         member _.OutputDir = None
         member _.OutputType = OutputType.Library
         member _.ProjectFile = ""
-        member _.ProjectOptions = failwith "Not implemented in test stub"
+        member _.ProjectOptions = invalidOp "Not implemented in test stub"
         member _.SourceFiles = [||]
         member _.Options = options
         member _.Plugins = { MemberDeclarationPlugins = Map.empty }
         member _.IncrementCounter() = 0
         member _.IsPrecompilingInlineFunction = false
-        member this.WillPrecompileInlineFunction _ = this :> Compiler
-        member _.GetImplementationFile _ = failwith "Not implemented in test stub"
+        member this.WillPrecompileInlineFunction _ = this
+        member _.GetImplementationFile _ = invalidOp "Not implemented in test stub"
         member _.GetRootModule _ = "", None
         member _.TryGetEntity _ = None
-        member _.GetInlineExpr _ = failwith "Not implemented in test stub"
+        member _.GetInlineExpr _ = invalidOp "Not implemented in test stub"
         member _.AddWatchDependency _ = ()
         member _.AddLog(_msg, _severity, ?range, ?fileName, ?tag) = ()
     }
@@ -78,6 +78,7 @@ let private withTempProject language (testFn: CrackerOptions -> unit) =
             try
                 IO.Directory.Delete(rootDir, true)
             with _ ->
+                // Best-effort cleanup; ignore IO errors from locked files.
                 ()
 
 let tests =

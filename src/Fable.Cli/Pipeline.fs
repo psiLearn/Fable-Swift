@@ -520,7 +520,7 @@ module Swift =
             return!
                 Async.FromContinuations(fun (_onSuccess, onError, onCancel) ->
                     if cancellationToken.IsCancellationRequested then
-                        onCancel (OperationCanceledException())
+                        onCancel (OperationCanceledException(cancellationToken))
                     else
                         onError (swiftNotImplemented ())
                 )

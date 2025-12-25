@@ -82,7 +82,8 @@ let createMutablePublicValue (com: ICompiler) value =
     | TypeScript -> JS.Replacements.createAtom com value
     | Rust
     | Php
-    | Dart -> value
+    | Dart
+    | Swift -> value
 
 let getRefCell (com: ICompiler) r typ (expr: Expr) =
     match com.Options.Language with
