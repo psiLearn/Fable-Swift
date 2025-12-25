@@ -226,7 +226,7 @@ let argLanguage (args: CliArgs) =
 
         match Map.tryFind normalized languageMap with
         | Some language -> Ok language
-        | None -> Error(languageErrorMessage normalized)
+        | None -> Error(languageErrorMessage lang)
     )
     |> Option.defaultValue (Ok JavaScript)
 

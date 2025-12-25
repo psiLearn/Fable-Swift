@@ -514,7 +514,17 @@ module Swift =
         (_isSilent: bool)
         (_outPath: string)
         =
-        Async.FromContinuations(fun (_onSuccess, onError, _onCancel) -> onError (swiftNotImplemented ()))
+        async {
+            let! cancellationToken = Async.CancellationToken
+
+            return!
+                Async.FromContinuations(fun (_onSuccess, onError, onCancel) ->
+                    if cancellationToken.IsCancellationRequested then
+                        onCancel (OperationCanceledException())
+                    else
+                        onError (swiftNotImplemented ())
+                )
+        }
 
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
     match com.Options.Language with

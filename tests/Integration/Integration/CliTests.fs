@@ -20,7 +20,7 @@ let private makeCompiler language libraryDir =
         member _.OutputDir = None
         member _.OutputType = OutputType.Library
         member _.ProjectFile = ""
-        member _.ProjectOptions = Unchecked.defaultof<_>
+        member _.ProjectOptions = failwith "Not implemented in test stub"
         member _.SourceFiles = [||]
         member _.Options = options
         member _.Plugins = { MemberDeclarationPlugins = Map.empty }
@@ -30,7 +30,7 @@ let private makeCompiler language libraryDir =
         member _.GetImplementationFile _ = failwith "Not implemented in test stub"
         member _.GetRootModule _ = "", None
         member _.TryGetEntity _ = None
-        member _.GetInlineExpr _ = Unchecked.defaultof<_>
+        member _.GetInlineExpr _ = failwith "Not implemented in test stub"
         member _.AddWatchDependency _ = ()
         member _.AddLog(_msg, _severity, ?range, ?fileName, ?tag) = ()
     }
@@ -75,7 +75,10 @@ let private withTempProject language (testFn: CrackerOptions -> unit) =
         testFn opts
     finally
         if IO.Directory.Exists(rootDir) then
-            IO.Directory.Delete(rootDir, true)
+            try
+                IO.Directory.Delete(rootDir, true)
+            with _ ->
+                ()
 
 let tests =
   testList "Cli" [
@@ -106,6 +109,16 @@ let tests =
     testCase "Default file extension for swift" <| fun () ->
         Expect.equal (File.defaultFileExt false Swift) ".fs.swift" "swift extension without outDir"
         Expect.equal (File.defaultFileExt true Swift) ".swift" "swift extension with outDir"
+
+    testCase "Unknown language preserves casing in error" <| fun () ->
+        let res = parseCliArgs ["--lang"; "SwiftY"]
+        Expect.isOk res "--lang invalid args"
+
+        match argLanguage res.Value with
+        | Ok _ -> failwith "Expected error for invalid language"
+        | Error msg ->
+            let expected = "'SwiftY' is not a valid language."
+            Expect.isTrue (msg.Contains(expected, StringComparison.Ordinal)) "error message preserves casing"
 
     testCase "Swift library path uses .swift extension" <| fun () ->
         let libraryDir = Path.normalizePath (IO.Path.Combine("temp", "fable-library-swift"))
