@@ -3,6 +3,7 @@ module Fable.Tests.Cli
 open System
 open Fable
 open Fable.Cli.Entry
+open Fable.Cli.Pipeline
 open Fable.Compiler.ProjectCracker
 open Fable.Compiler.Util
 open Fable.Transforms
@@ -135,4 +136,51 @@ let tests =
 
             Expect.equal (getFableLibraryPath opts false) expected "swift fable library path"
         )
+
+    testCase "Swift compile path writes placeholder file" <| fun () ->
+        let rootDir = IO.Path.Combine(IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"))
+        let outPath = IO.Path.Combine(rootDir, "Test.swift")
+
+        let compiler = makeCompiler Swift "lib"
+        let cliArgs: CliArgs =
+            {
+                ProjectFile = ""
+                RootDir = rootDir
+                OutDir = Some rootDir
+                IsWatch = false
+                Precompile = false
+                PrecompiledLib = None
+                PrintAst = false
+                FableLibraryPath = None
+                Configuration = "Debug"
+                NoRestore = true
+                NoCache = true
+                NoParallelTypeCheck = false
+                SourceMaps = false
+                SourceMapsRoot = None
+                Exclude = []
+                Replace = Map.empty
+                RunProcess = None
+                CompilerOptions = CompilerOptionsHelper.Make(language = Swift)
+                Verbosity = Verbosity.Normal
+            }
+
+        let pathResolver =
+            { new PathResolver with
+                member _.TryPrecompiledOutPath(_, _) = None
+                member _.GetOrAddDeduplicateTargetDir(_, addTargetDir) = addTargetDir Set.empty }
+
+        try
+            Fable.Cli.Pipeline.Swift.compileFile compiler cliArgs pathResolver false outPath
+            |> Async.RunSynchronously
+
+            Expect.isTrue (IO.File.Exists(outPath)) "placeholder file exists"
+
+            let content = IO.File.ReadAllText(outPath)
+            Expect.stringContains content "Swift backend is not implemented yet" "placeholder content"
+            Expect.stringContains content compiler.CurrentFile "includes source path"
+            Expect.stringContains content outPath "includes out path"
+        finally
+            if IO.Directory.Exists(rootDir) then
+                IO.Directory.Delete(rootDir, true)
   ]

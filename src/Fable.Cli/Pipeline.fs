@@ -503,26 +503,32 @@ module Rust =
         }
 
 module Swift =
-    let private swiftNotImplemented () =
-        Fable.Transforms.Swift.Fable2Swift.notImplemented ()
-
     let compileFile
-        (_com: Compiler)
+        (com: Compiler)
         (_cliArgs: CliArgs)
         (_pathResolver: PathResolver)
         (_isSilent: bool)
-        (_outPath: string)
+        (outPath: string)
         =
         async {
-            let! cancellationToken = Async.CancellationToken
+            let! ct = Async.CancellationToken
 
-            return!
-                Async.FromContinuations(fun (_onSuccess, onError, onCancel) ->
-                    if cancellationToken.IsCancellationRequested then
-                        onCancel (OperationCanceledException(cancellationToken))
-                    else
-                        onError (swiftNotImplemented ())
-                )
+            let dir = IO.Path.GetDirectoryName(outPath)
+
+            match dir with
+            | null
+            | "" -> ()
+            | dir -> IO.Directory.CreateDirectory(dir) |> ignore
+
+            let content: string =
+                Fable.Transforms.Swift.Fable2Swift.placeholderContent com.CurrentFile outPath
+
+            do! Async.SwitchToThreadPool()
+
+            if ct.IsCancellationRequested then
+                return! Async.FromContinuations(fun (_s, _e, cancel) -> cancel (OperationCanceledException(ct)))
+
+            do! IO.File.WriteAllTextAsync(outPath, content, ct) |> Async.AwaitTask
         }
 
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
