@@ -46,6 +46,9 @@
     <Compile Include="Dart/Dart.fs" />
     <Compile Include="Dart/Fable2Dart.fs" />
     <Compile Include="Dart/DartPrinter.fs" />
+    <Compile Include="Swift/Swift.fs" />
+    <Compile Include="Swift/SwiftPrinter.fs" />
+    <Compile Include="Swift/Fable2Swift.fs" />
     <Compile Include="Rust/RustPrinter.fs" />
     <Compile Include="Rust/Fable2Rust.fs" />
     <Compile Include="State.fs" />

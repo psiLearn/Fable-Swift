@@ -504,8 +504,7 @@ module Rust =
 
 module Swift =
     let private swiftNotImplemented () =
-        "Swift backend is not implemented yet. See docs/swift-backend-feasibility.md."
-        |> Fable.FableError
+        Fable.Transforms.Swift.Fable2Swift.notImplemented ()
 
     let compileFile
         (_com: Compiler)
