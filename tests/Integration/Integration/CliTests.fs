@@ -7,10 +7,27 @@ open Fable.Cli.Pipeline
 open Fable.Compiler.ProjectCracker
 open Fable.Compiler.Util
 open Fable.Transforms
+open Fable.AST.Swift
+open Fable.Transforms.Printer
+open Fable.Transforms.Swift
+open Fable.Transforms.Swift.SwiftPrinter
 open Expecto
 
 type Result<'T1, 'T2> with
     member this.Value = match this with Ok v -> v | Error _ -> failwith "I'm Error!"
+
+type InMemoryWriter(write: string -> unit) =
+    interface Printer.Writer with
+        member _.Write(str) =
+            write str
+            async.Return()
+
+        member _.MakeImportPath(path) = path
+        member _.AddSourceMapping(_, _, _, _, _, _) = ()
+        member _.AddLog(_msg, _severity, ?range) = ()
+
+    interface IDisposable with
+        member _.Dispose() = ()
 
 let private makeCompiler language libraryDir =
     let options = CompilerOptionsHelper.Make(language = language)
@@ -183,4 +200,27 @@ let tests =
         finally
             if IO.Directory.Exists(rootDir) then
                 IO.Directory.Delete(rootDir, true)
+
+    testCase "Swift printer formats comments and blocks" <| fun () ->
+        let mutable written = ""
+
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftComment "headline"
+                        SwiftStatementDecl(
+                            SwiftBlock [ SwiftExpr(SwiftIdentifier "run()") ]
+                        )
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "// headline"; "{"; "    run()"; "}"; "" ]
+
+        Expect.equal written expected "renders comments and indented blocks"
   ]

@@ -31,20 +31,21 @@ let rec private renderStatement (indent: string) =
             indent + body
     | SwiftBlock statements ->
         let innerIndent = indent + indentStep
+        let nl = Environment.NewLine
 
         let inner =
             statements
             |> List.map (renderStatement innerIndent)
             |> List.filter (fun line -> not (String.IsNullOrWhiteSpace line))
-            |> String.concat Environment.NewLine
+            |> String.concat nl
 
         let openBrace = indent + "{"
         let closeBrace = indent + "}"
 
         if String.IsNullOrWhiteSpace(inner) then
-            $"{openBrace}\n{closeBrace}"
+            String.concat nl [ openBrace; closeBrace ]
         else
-            $"{openBrace}\n{inner}\n{closeBrace}"
+            String.concat nl [ openBrace; inner; closeBrace ]
 
 let private renderDeclaration indent =
     function
