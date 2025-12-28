@@ -67,6 +67,11 @@ let rec private renderStatement (indent: string) =
             ""
         else
             indent + body
+    | SwiftReturn maybeExpr ->
+        match maybeExpr |> Option.map renderExpression with
+        | None -> indent + "return"
+        | Some rendered when String.IsNullOrWhiteSpace(rendered) -> indent + "return /* invalid expression */"
+        | Some rendered -> indent + "return " + rendered
     | SwiftBlock statements ->
         let innerIndent = indent + indentStep
         let nl = Environment.NewLine

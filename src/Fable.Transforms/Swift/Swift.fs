@@ -29,6 +29,7 @@ type SwiftBindingDecl =
 type SwiftStatement =
     | SwiftExpr of SwiftExpression
     | SwiftBlock of SwiftBlock
+    | SwiftReturn of SwiftExpression option
 
 type SwiftDeclaration =
     | SwiftComment of string

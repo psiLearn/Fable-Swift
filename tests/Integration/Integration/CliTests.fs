@@ -248,6 +248,30 @@ let tests =
 
         Expect.equal written expected "renders function with block"
 
+    testCase "Swift printer formats return without expression" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftFuncDecl
+                            {
+                                Name = "main"
+                                Parameters = []
+                                Body = [ SwiftReturn None ]
+                            }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "func main()"; "{"; "    return"; "}"; "" ]
+
+        Expect.equal written expected "renders bare return"
+
     testCase "Swift printer formats imports and functions" <| fun () ->
         let mutable written = ""
         let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
@@ -279,7 +303,11 @@ let tests =
                             {
                                 Name = "main"
                                 Parameters = [ "value"; "count" ]
-                                Body = [ SwiftExpr(SwiftIdentifier "run()") ]
+                                Body =
+                                    [
+                                        SwiftExpr(SwiftIdentifier "run()")
+                                        SwiftReturn(Some(SwiftIdentifier "value"))
+                                    ]
                             }
                     ]
             }
@@ -297,6 +325,7 @@ let tests =
                     "func main(value, count)"
                     "{"
                     "    run()"
+                    "    return value"
                     "}"
                     ""
                 ]
