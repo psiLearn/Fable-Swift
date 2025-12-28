@@ -5,7 +5,11 @@ type SwiftExpression =
     | SwiftIdentifier of string
     | SwiftLiteral of string
 
-type SwiftStatement = | SwiftExpr of SwiftExpression
+type SwiftBlock = SwiftStatement list
+
+type SwiftStatement =
+    | SwiftExpr of SwiftExpression
+    | SwiftBlock of SwiftBlock
 
 type SwiftDeclaration =
     | SwiftComment of string

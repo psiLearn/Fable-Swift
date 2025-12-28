@@ -7,6 +7,8 @@ open Fable.Transforms.Printer
 
 let isEmpty (file: SwiftFile) = List.isEmpty file.Declarations
 
+let private indentStep = "    "
+
 let private safe (text: string) =
     if isNull text then
         ""
@@ -18,11 +20,33 @@ let private renderExpression =
     | SwiftIdentifier name -> safe name
     | SwiftLiteral literal -> safe literal
 
-let private renderStatement =
+let rec private renderStatement (indent: string) =
     function
-    | SwiftExpr expr -> renderExpression expr
+    | SwiftExpr expr ->
+        let body = renderExpression expr
 
-let private renderDeclaration =
+        if String.IsNullOrWhiteSpace(body) then
+            ""
+        else
+            indent + body
+    | SwiftBlock statements ->
+        let innerIndent = indent + indentStep
+
+        let inner =
+            statements
+            |> List.map (renderStatement innerIndent)
+            |> List.filter (fun line -> not (String.IsNullOrWhiteSpace line))
+            |> String.concat Environment.NewLine
+
+        let openBrace = indent + "{"
+        let closeBrace = indent + "}"
+
+        if String.IsNullOrWhiteSpace(inner) then
+            $"{openBrace}\n{closeBrace}"
+        else
+            $"{openBrace}\n{inner}\n{closeBrace}"
+
+let private renderDeclaration indent =
     function
     | SwiftComment text ->
         let body = safe text
@@ -30,18 +54,18 @@ let private renderDeclaration =
         if String.IsNullOrWhiteSpace(body) then
             ""
         else
-            $"// {body}"
-    | SwiftStatementDecl stmt -> renderStatement stmt
+            $"{indent}// {body}"
+    | SwiftStatementDecl stmt -> renderStatement indent stmt
 
 let private renderFile (file: SwiftFile) =
     let sb = StringBuilder()
 
     file.Declarations
     |> List.iter (fun decl ->
-        let line = renderDeclaration decl
+        let line = renderDeclaration "" decl
 
         if not (String.IsNullOrWhiteSpace line) then
-            // TODO: extend with indentation, statements/blocks, and other declaration kinds as Swift AST grows.
+            // TODO: extend with additional declaration kinds as Swift AST grows.
             sb.AppendLine(line) |> ignore
     )
 
