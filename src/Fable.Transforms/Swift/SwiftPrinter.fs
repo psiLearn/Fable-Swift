@@ -56,6 +56,19 @@ let private renderDeclaration indent =
             ""
         else
             $"{indent}// {body}"
+    | SwiftFuncDecl funcDecl ->
+        let name = safe funcDecl.Name
+
+        if String.IsNullOrWhiteSpace(name) then
+            ""
+        else
+            let header = indent + $"func {name}()"
+            let block = renderStatement indent (SwiftBlock funcDecl.Body)
+
+            if String.IsNullOrWhiteSpace(block) then
+                header
+            else
+                String.concat Environment.NewLine [ header; block ]
     | SwiftStatementDecl stmt -> renderStatement indent stmt
 
 let private renderFile (file: SwiftFile) =

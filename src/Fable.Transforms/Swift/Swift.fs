@@ -7,6 +7,12 @@ type SwiftExpression =
 
 type SwiftBlock = SwiftStatement list
 
+type SwiftFunctionDecl =
+    {
+        Name: string
+        Body: SwiftBlock
+    }
+
 type SwiftStatement =
     | SwiftExpr of SwiftExpression
     | SwiftBlock of SwiftBlock
@@ -14,5 +20,6 @@ type SwiftStatement =
 type SwiftDeclaration =
     | SwiftComment of string
     | SwiftStatementDecl of SwiftStatement
+    | SwiftFuncDecl of SwiftFunctionDecl
 
 type SwiftFile = { Declarations: SwiftDeclaration list }
