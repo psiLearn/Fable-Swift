@@ -300,4 +300,34 @@ let tests =
                 ]
 
         Expect.equal written expected "renders import, bindings, then function"
+
+    testCase "Swift printer formats call expressions" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftBinding
+                            {
+                                Name = "result"
+                                Expr =
+                                    Some(
+                                        SwiftCall(
+                                            SwiftIdentifier "foo",
+                                            [ SwiftIdentifier "bar"; SwiftLiteral "1" ]
+                                        )
+                                    )
+                                IsMutable = false
+                            }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "let result = foo(bar, 1)"; "" ]
+
+        Expect.equal written expected "renders call expression"
   ]

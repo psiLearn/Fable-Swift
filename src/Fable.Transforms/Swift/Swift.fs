@@ -5,6 +5,7 @@ type SwiftExpression =
     | SwiftIdentifier of string
     | SwiftLiteral of string
     | SwiftMemberAccess of SwiftExpression * string
+    | SwiftCall of SwiftExpression * SwiftExpression list
 
 type SwiftBlock = SwiftStatement list
 

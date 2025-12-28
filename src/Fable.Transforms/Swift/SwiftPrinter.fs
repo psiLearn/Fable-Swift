@@ -27,6 +27,19 @@ let rec private renderExpression =
             ""
         else
             $"{target}.{memberText}"
+    | SwiftCall(callee, args) ->
+        let renderedCallee = renderExpression callee
+
+        if String.IsNullOrWhiteSpace(renderedCallee) then
+            ""
+        else
+            let renderedArgs =
+                args
+                |> List.map renderExpression
+                |> List.filter (String.IsNullOrWhiteSpace >> not)
+                |> String.concat ", "
+
+            $"{renderedCallee}({renderedArgs})"
 
 let rec private renderStatement (indent: string) =
     function
