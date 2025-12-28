@@ -318,7 +318,11 @@ let tests =
                                     Some(
                                         SwiftCall(
                                             SwiftIdentifier "foo",
-                                            [ SwiftIdentifier "bar"; SwiftLiteral "1" ]
+                                            [
+                                                SwiftIdentifier "bar"
+                                                SwiftLiteral "1"
+                                                SwiftStringLiteral "hi\nthere"
+                                            ]
                                         )
                                     )
                                 IsMutable = false
@@ -329,7 +333,9 @@ let tests =
         SwiftPrinter.run capture file |> Async.RunSynchronously
 
         let expected =
-            String.concat Environment.NewLine [ "let result = foo(bar, 1)"; "" ]
+            String.concat
+                Environment.NewLine
+                [ "let result = foo(bar, 1, \"hi\\nthere\")"; "" ]
 
         Expect.equal written expected "renders call expression"
   ]

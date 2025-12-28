@@ -15,10 +15,27 @@ let private safe (text: string) =
     else
         text
 
+let rec private escapeStringLiteral (value: string) =
+    let sb = StringBuilder()
+
+    value
+    |> Seq.iter (fun ch ->
+        match ch with
+        | '\\' -> sb.Append("\\\\") |> ignore
+        | '"' -> sb.Append("\\\"") |> ignore
+        | '\n' -> sb.Append("\\n") |> ignore
+        | '\r' -> sb.Append("\\r") |> ignore
+        | '\t' -> sb.Append("\\t") |> ignore
+        | _ -> sb.Append(ch) |> ignore
+    )
+
+    sb.ToString()
+
 let rec private renderExpression =
     function
     | SwiftIdentifier name -> safe name
     | SwiftLiteral literal -> safe literal
+    | SwiftStringLiteral text -> $"\"{escapeStringLiteral (safe text)}\""
     | SwiftMemberAccess(expr, memberName) ->
         let target = renderExpression expr
         let memberText = safe memberName

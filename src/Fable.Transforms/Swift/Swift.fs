@@ -4,6 +4,7 @@ module rec Fable.AST.Swift
 type SwiftExpression =
     | SwiftIdentifier of string
     | SwiftLiteral of string
+    | SwiftStringLiteral of string
     | SwiftMemberAccess of SwiftExpression * string
     | SwiftCall of SwiftExpression * SwiftExpression list
 
