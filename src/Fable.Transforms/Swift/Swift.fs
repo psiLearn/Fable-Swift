@@ -4,6 +4,7 @@ module rec Fable.AST.Swift
 type SwiftExpression =
     | SwiftIdentifier of string
     | SwiftLiteral of string
+    | SwiftMemberAccess of SwiftExpression * string
 
 type SwiftBlock = SwiftStatement list
 
@@ -15,6 +16,13 @@ type SwiftFunctionDecl =
 
 type SwiftImportDecl = { Module: string }
 
+type SwiftBindingDecl =
+    {
+        Name: string
+        Expr: SwiftExpression option
+        IsMutable: bool
+    }
+
 type SwiftStatement =
     | SwiftExpr of SwiftExpression
     | SwiftBlock of SwiftBlock
@@ -22,6 +30,7 @@ type SwiftStatement =
 type SwiftDeclaration =
     | SwiftComment of string
     | SwiftImport of SwiftImportDecl
+    | SwiftBinding of SwiftBindingDecl
     | SwiftStatementDecl of SwiftStatement
     | SwiftFuncDecl of SwiftFunctionDecl
 

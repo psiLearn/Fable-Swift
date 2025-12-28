@@ -256,6 +256,24 @@ let tests =
                 Declarations =
                     [
                         SwiftImport { Module = "Foundation" }
+                        SwiftBinding
+                            {
+                                Name = "answer"
+                                Expr = Some(SwiftLiteral "42")
+                                IsMutable = false
+                            }
+                        SwiftBinding
+                            {
+                                Name = "counter"
+                                Expr = None
+                                IsMutable = true
+                            }
+                        SwiftBinding
+                            {
+                                Name = "nested"
+                                Expr = Some(SwiftMemberAccess(SwiftIdentifier "foo", "bar"))
+                                IsMutable = false
+                            }
                         SwiftFuncDecl
                             {
                                 Name = "main"
@@ -267,7 +285,19 @@ let tests =
         SwiftPrinter.run capture file |> Async.RunSynchronously
 
         let expected =
-            String.concat Environment.NewLine [ "import Foundation"; "func main()"; "{"; "    run()"; "}"; "" ]
+            String.concat
+                Environment.NewLine
+                [
+                    "import Foundation"
+                    "let answer = 42"
+                    "var counter"
+                    "let nested = foo.bar"
+                    "func main()"
+                    "{"
+                    "    run()"
+                    "}"
+                    ""
+                ]
 
-        Expect.equal written expected "renders import then function"
+        Expect.equal written expected "renders import, bindings, then function"
   ]

@@ -15,10 +15,18 @@ let private safe (text: string) =
     else
         text
 
-let private renderExpression =
+let rec private renderExpression =
     function
     | SwiftIdentifier name -> safe name
     | SwiftLiteral literal -> safe literal
+    | SwiftMemberAccess(expr, memberName) ->
+        let target = renderExpression expr
+        let memberText = safe memberName
+
+        if String.IsNullOrWhiteSpace(target) || String.IsNullOrWhiteSpace(memberText) then
+            ""
+        else
+            $"{target}.{memberText}"
 
 let rec private renderStatement (indent: string) =
     function
@@ -63,6 +71,27 @@ let private renderDeclaration indent =
             ""
         else
             indent + $"import {moduleName}"
+    | SwiftBinding bindingDecl ->
+        let name = safe bindingDecl.Name
+
+        if String.IsNullOrWhiteSpace(name) then
+            ""
+        else
+            let keyword =
+                if bindingDecl.IsMutable then
+                    "var"
+                else
+                    "let"
+
+            match bindingDecl.Expr with
+            | None -> $"{indent}{keyword} {name}"
+            | Some expr ->
+                let rhs = renderExpression expr
+
+                if String.IsNullOrWhiteSpace(rhs) then
+                    $"{indent}{keyword} {name}"
+                else
+                    $"{indent}{keyword} {name} = {rhs}"
     | SwiftFuncDecl funcDecl ->
         let name = safe funcDecl.Name
 
