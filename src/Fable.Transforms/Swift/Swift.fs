@@ -7,6 +7,8 @@ type SwiftExpression =
 
 type SwiftStatement = | SwiftExpr of SwiftExpression
 
-type SwiftDeclaration = | SwiftStatementDecl of SwiftStatement
+type SwiftDeclaration =
+    | SwiftComment of string
+    | SwiftStatementDecl of SwiftStatement
 
 type SwiftFile = { Declarations: SwiftDeclaration list }

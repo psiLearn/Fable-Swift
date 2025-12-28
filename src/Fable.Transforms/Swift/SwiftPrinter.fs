@@ -24,6 +24,13 @@ let private renderStatement =
 
 let private renderDeclaration =
     function
+    | SwiftComment text ->
+        let body = safe text
+
+        if String.IsNullOrWhiteSpace(body) then
+            ""
+        else
+            $"// {body}"
     | SwiftStatementDecl stmt -> renderStatement stmt
 
 let private renderFile (file: SwiftFile) =

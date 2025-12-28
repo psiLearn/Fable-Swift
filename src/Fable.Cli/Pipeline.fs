@@ -1,6 +1,7 @@
 module Fable.Cli.Pipeline
 
 open System
+open System.Threading
 open Fable
 open Fable.AST
 open Fable.Transforms
@@ -503,11 +504,27 @@ module Rust =
         }
 
 module Swift =
+    type SwiftWriter(com: Compiler, targetPath: string, ct: CancellationToken) =
+        let stream = new IO.StreamWriter(targetPath)
+
+        interface Printer.Writer with
+            member _.Write(str) =
+                stream.WriteAsync(str.AsMemory(), ct) |> Async.AwaitTask
+
+            member _.MakeImportPath(path) = path
+            member _.AddSourceMapping(_, _, _, _, _, _) = ()
+
+            member _.AddLog(msg, severity, ?range) =
+                com.AddLog(msg, severity, ?range = range, fileName = com.CurrentFile)
+
+        interface IDisposable with
+            member _.Dispose() = stream.Dispose()
+
     let compileFile
         (com: Compiler)
         (_cliArgs: CliArgs)
         (_pathResolver: PathResolver)
-        (_isSilent: bool)
+        (isSilent: bool)
         (outPath: string)
         =
         async {
@@ -520,15 +537,14 @@ module Swift =
             | "" -> ()
             | dir -> IO.Directory.CreateDirectory(dir) |> ignore
 
-            let content: string =
-                Fable.Transforms.Swift.Fable2Swift.placeholderContent com.CurrentFile outPath
+            ct.ThrowIfCancellationRequested()
 
-            do! Async.SwitchToThreadPool()
+            let file =
+                Fable.Transforms.Swift.Fable2Swift.placeholderFile com.CurrentFile outPath
 
-            if ct.IsCancellationRequested then
-                return! Async.FromContinuations(fun (_s, _e, cancel) -> cancel (OperationCanceledException(ct)))
-
-            do! IO.File.WriteAllTextAsync(outPath, content, ct) |> Async.AwaitTask
+            if not (isSilent || Fable.Transforms.Swift.SwiftPrinter.isEmpty file) then
+                use writer = new SwiftWriter(com, outPath, ct)
+                do! Fable.Transforms.Swift.SwiftPrinter.run writer file
         }
 
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
