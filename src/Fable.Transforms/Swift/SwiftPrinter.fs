@@ -56,6 +56,13 @@ let private renderDeclaration indent =
             ""
         else
             $"{indent}// {body}"
+    | SwiftImport importDecl ->
+        let moduleName = safe importDecl.Module
+
+        if String.IsNullOrWhiteSpace(moduleName) then
+            ""
+        else
+            indent + $"import {moduleName}"
     | SwiftFuncDecl funcDecl ->
         let name = safe funcDecl.Name
 

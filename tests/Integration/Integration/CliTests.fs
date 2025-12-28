@@ -246,4 +246,28 @@ let tests =
             String.concat Environment.NewLine [ "func main()"; "{"; "    run()"; "}"; "" ]
 
         Expect.equal written expected "renders function with block"
+
+    testCase "Swift printer formats imports and functions" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftImport { Module = "Foundation" }
+                        SwiftFuncDecl
+                            {
+                                Name = "main"
+                                Body = [ SwiftExpr(SwiftIdentifier "run()") ]
+                            }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "import Foundation"; "func main()"; "{"; "    run()"; "}"; "" ]
+
+        Expect.equal written expected "renders import then function"
   ]

@@ -13,12 +13,15 @@ type SwiftFunctionDecl =
         Body: SwiftBlock
     }
 
+type SwiftImportDecl = { Module: string }
+
 type SwiftStatement =
     | SwiftExpr of SwiftExpression
     | SwiftBlock of SwiftBlock
 
 type SwiftDeclaration =
     | SwiftComment of string
+    | SwiftImport of SwiftImportDecl
     | SwiftStatementDecl of SwiftStatement
     | SwiftFuncDecl of SwiftFunctionDecl
 
