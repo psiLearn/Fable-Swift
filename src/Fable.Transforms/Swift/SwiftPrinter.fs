@@ -111,7 +111,13 @@ let private renderDeclaration indent =
         if String.IsNullOrWhiteSpace(name) then
             ""
         else
-            let header = indent + $"func {name}()"
+            let parameters =
+                funcDecl.Parameters
+                |> List.map safe
+                |> List.filter (String.IsNullOrWhiteSpace >> not)
+                |> String.concat ", "
+
+            let header = indent + $"func {name}({parameters})"
             let block = renderStatement indent (SwiftBlock funcDecl.Body)
 
             if String.IsNullOrWhiteSpace(block) then

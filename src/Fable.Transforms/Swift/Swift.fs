@@ -12,6 +12,7 @@ type SwiftBlock = SwiftStatement list
 type SwiftFunctionDecl =
     {
         Name: string
+        Parameters: string list
         Body: SwiftBlock
     }
 

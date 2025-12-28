@@ -235,6 +235,7 @@ let tests =
                         SwiftFuncDecl
                             {
                                 Name = "main"
+                                Parameters = []
                                 Body = [ SwiftExpr(SwiftIdentifier "run()") ]
                             }
                     ]
@@ -277,6 +278,7 @@ let tests =
                         SwiftFuncDecl
                             {
                                 Name = "main"
+                                Parameters = [ "value"; "count" ]
                                 Body = [ SwiftExpr(SwiftIdentifier "run()") ]
                             }
                     ]
@@ -292,7 +294,7 @@ let tests =
                     "let answer = 42"
                     "var counter"
                     "let nested = foo.bar"
-                    "func main()"
+                    "func main(value, count)"
                     "{"
                     "    run()"
                     "}"
