@@ -23,6 +23,20 @@ let handle (args: string list) =
     Directory.clean packageDestination
 
     let tempVersion = "5.999.0-local-build-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")
+    let tempChangelogPath = Path.Resolve("temp", "CHANGELOG.local.md")
+    let tempChangelogDate = DateTime.Now.ToString("yyyy-MM-dd")
+
+    let tempChangelogContent =
+        $"""# Changelog
+
+## {tempVersion} - {tempChangelogDate}
+
+### Changed
+- Local build.
+"""
+
+    Directory.CreateDirectory(Path.GetDirectoryName(tempChangelogPath)) |> ignore
+    File.WriteAllText(tempChangelogPath, tempChangelogContent)
 
     let compilerFsPath =
         Path.Resolve("src", "Fable.Transforms", "Global", "Compiler.fs")
@@ -44,6 +58,7 @@ let handle (args: string list) =
         |> CmdLine.appendPrefix "-c" "Release"
         // By pass the PackageVersion in the fsproj, without having to modify it on the disk
         |> CmdLine.appendRaw $"-p:PackageVersion={tempVersion}"
+        |> CmdLine.appendRaw $"-p:ChangelogFile={tempChangelogPath}"
         |> CmdLine.appendPrefix "-o" packageDestination
         |> CmdLine.toString
     )
@@ -56,6 +71,7 @@ let handle (args: string list) =
         |> CmdLine.appendPrefix "-c" "Release"
         // By pass the PackageVersion in the fsproj, without having to modify it on the disk
         |> CmdLine.appendRaw $"-p:PackageVersion={tempVersion}"
+        |> CmdLine.appendRaw $"-p:ChangelogFile={tempChangelogPath}"
         |> CmdLine.appendPrefix "-o" packageDestination
         |> CmdLine.toString
     )
@@ -71,9 +87,12 @@ let handle (args: string list) =
         |> CmdLine.appendPrefix "-c" "Release"
         // By pass the PackageVersion in the fsproj, without having to modify it on the disk
         |> CmdLine.appendRaw $"-p:PackageVersion={tempVersion}"
+        |> CmdLine.appendRaw $"-p:ChangelogFile={tempChangelogPath}"
         |> CmdLine.appendPrefix "-o" packageDestination
         |> CmdLine.toString
     )
+
+    File.Delete(tempChangelogPath)
 
     printfn
         $"""Local packages created.
