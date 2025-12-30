@@ -540,7 +540,18 @@ module Swift =
             ct.ThrowIfCancellationRequested()
 
             let file =
-                Fable.Transforms.Swift.Fable2Swift.placeholderFile com.CurrentFile outPath
+                if String.IsNullOrWhiteSpace(com.CurrentFile) || Array.isEmpty com.SourceFiles then
+                    addWarning
+                        com
+                        []
+                        None
+                        "Swift backend: using placeholder output because CurrentFile or SourceFiles are missing."
+
+                    Fable.Transforms.Swift.Fable2Swift.placeholderFile com.CurrentFile outPath
+                else
+                    FSharp2Fable.Compiler.transformFile com
+                    |> FableTransforms.transformFile com
+                    |> Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com
 
             if not (isSilent || Fable.Transforms.Swift.SwiftPrinter.isEmpty file) then
                 use writer = new SwiftWriter(com, outPath, ct)

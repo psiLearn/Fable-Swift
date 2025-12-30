@@ -367,4 +367,42 @@ let tests =
                 [ "let result = foo(bar, 1, \"hi\\nthere\")"; "" ]
 
         Expect.equal written expected "renders call expression"
+
+    testCase "Swift transform uses bindings for zero-arg members" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let numberType =
+            Fable.AST.Fable.Number(Fable.AST.NumberKind.Int32, Fable.AST.Fable.NumberInfo.Empty)
+
+        let memberRef = Fable.AST.Fable.GeneratedMember.Value("answer", numberType, isInstance = false)
+
+        let decl: Fable.AST.Fable.MemberDecl =
+            {
+                Name = "answer"
+                Args = []
+                Body =
+                    Fable.AST.Fable.Value(
+                        Fable.AST.Fable.NumberConstant(
+                            Fable.AST.Fable.NumberValue.Int32 42,
+                            Fable.AST.Fable.NumberInfo.Empty
+                        ),
+                        None
+                    )
+                MemberRef = memberRef
+                IsMangled = false
+                ImplementedSignatureRef = None
+                UsedNames = Set.empty
+                XmlDoc = None
+                Tags = []
+            }
+
+        let file = Fable.AST.Fable.File([ Fable.AST.Fable.MemberDeclaration decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | [ SwiftBinding binding ] ->
+            Expect.equal binding.Name "answer" "binding name"
+            Expect.equal binding.Expr (Some(SwiftLiteral "42")) "binding value"
+        | declarations ->
+            failtestf "Expected single SwiftBinding, got %A" declarations
   ]

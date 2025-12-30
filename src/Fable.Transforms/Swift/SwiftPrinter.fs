@@ -58,6 +58,28 @@ let rec private renderExpression =
 
             $"{renderedCallee}({renderedArgs})"
 
+let private renderBindingDecl indent (bindingDecl: SwiftBindingDecl) =
+    let name = safe bindingDecl.Name
+
+    if String.IsNullOrWhiteSpace(name) then
+        ""
+    else
+        let keyword =
+            if bindingDecl.IsMutable then
+                "var"
+            else
+                "let"
+
+        match bindingDecl.Expr with
+        | None -> $"{indent}{keyword} {name}"
+        | Some expr ->
+            let rhs = renderExpression expr
+
+            if String.IsNullOrWhiteSpace(rhs) then
+                $"{indent}{keyword} {name}"
+            else
+                $"{indent}{keyword} {name} = {rhs}"
+
 let rec private renderStatement (indent: string) =
     function
     | SwiftExpr expr ->
@@ -72,6 +94,7 @@ let rec private renderStatement (indent: string) =
         | None -> indent + "return"
         | Some rendered when String.IsNullOrWhiteSpace(rendered) -> indent + "return /* invalid expression */"
         | Some rendered -> indent + "return " + rendered
+    | SwiftBindingStatement bindingDecl -> renderBindingDecl indent bindingDecl
     | SwiftBlock statements ->
         let innerIndent = indent + indentStep
         let nl = Environment.NewLine
@@ -106,27 +129,7 @@ let private renderDeclaration indent =
             ""
         else
             indent + $"import {moduleName}"
-    | SwiftBinding bindingDecl ->
-        let name = safe bindingDecl.Name
-
-        if String.IsNullOrWhiteSpace(name) then
-            ""
-        else
-            let keyword =
-                if bindingDecl.IsMutable then
-                    "var"
-                else
-                    "let"
-
-            match bindingDecl.Expr with
-            | None -> $"{indent}{keyword} {name}"
-            | Some expr ->
-                let rhs = renderExpression expr
-
-                if String.IsNullOrWhiteSpace(rhs) then
-                    $"{indent}{keyword} {name}"
-                else
-                    $"{indent}{keyword} {name} = {rhs}"
+    | SwiftBinding bindingDecl -> renderBindingDecl indent bindingDecl
     | SwiftFuncDecl funcDecl ->
         let name = safe funcDecl.Name
 

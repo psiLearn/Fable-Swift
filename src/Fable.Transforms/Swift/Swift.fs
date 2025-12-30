@@ -30,6 +30,7 @@ type SwiftStatement =
     | SwiftExpr of SwiftExpression
     | SwiftBlock of SwiftBlock
     | SwiftReturn of SwiftExpression option
+    | SwiftBindingStatement of SwiftBindingDecl
 
 type SwiftDeclaration =
     | SwiftComment of string
