@@ -79,6 +79,9 @@ type Stream =
                     | true -> return false
         }
 
+let private encodeSourceMapUrl (mapPath: string) =
+    mapPath |> IO.Path.GetFileName |> Uri.EscapeDataString
+
 module Js =
     type BabelWriter
         (com: Compiler, cliArgs: CliArgs, pathResolver: PathResolver, sourcePath: string, targetPath: string)
@@ -96,10 +99,9 @@ module Js =
             async {
                 if cliArgs.SourceMaps then
                     let mapPath = targetPath + ".map"
+                    let mapUrl = encodeSourceMapUrl mapPath
 
-                    do!
-                        stream.WriteLineAsync($"//# sourceMappingURL={IO.Path.GetFileName(mapPath)}")
-                        |> Async.AwaitTask
+                    do! stream.WriteLineAsync($"//# sourceMappingURL={mapUrl}") |> Async.AwaitTask
 
                 do! stream.FlushAsync() |> Async.AwaitTask
 
@@ -504,15 +506,63 @@ module Rust =
         }
 
 module Swift =
-    type SwiftWriter(com: Compiler, targetPath: string, ct: CancellationToken) =
+    type SwiftWriter
+        (com: Compiler, cliArgs: CliArgs, pathResolver: PathResolver, targetPath: string, ct: CancellationToken)
+        =
+        let sourcePath = com.CurrentFile
+        let fileExt = cliArgs.CompilerOptions.FileExtension
+        let projDir = IO.Path.GetDirectoryName(cliArgs.ProjectFile)
         let stream = new IO.StreamWriter(targetPath)
+
+        let mapGenerator =
+            lazy (SourceMapSharp.SourceMapGenerator(?sourceRoot = cliArgs.SourceMapsRoot))
+
+        member _.WriteSourceMapIfEnabled() =
+            async {
+                if cliArgs.SourceMaps then
+                    let mapPath = targetPath + ".map"
+                    let mapUrl = encodeSourceMapUrl mapPath
+                    do! stream.WriteLineAsync($"//# sourceMappingURL={mapUrl}") |> Async.AwaitTask
+                    do! stream.FlushAsync() |> Async.AwaitTask
+                    use fs = IO.File.Open(mapPath, IO.FileMode.Create)
+                    do! mapGenerator.Force().toJSON().SerializeAsync(fs) |> Async.AwaitTask
+            }
 
         interface Printer.Writer with
             member _.Write(str) =
                 stream.WriteAsync(str.AsMemory(), ct) |> Async.AwaitTask
 
-            member _.MakeImportPath(path) = path
-            member _.AddSourceMapping(_, _, _, _, _, _) = ()
+            member _.MakeImportPath(path) =
+                let path =
+                    Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+
+                if path.EndsWith(".fs", StringComparison.Ordinal) then
+                    Path.ChangeExtension(path, fileExt)
+                else
+                    path
+
+            member _.AddSourceMapping(srcLine, srcCol, genLine, genCol, file, displayName) =
+                if cliArgs.SourceMaps then
+                    let generated: SourceMapSharp.Util.MappingIndex =
+                        {
+                            line = genLine
+                            column = genCol
+                        }
+
+                    let original: SourceMapSharp.Util.MappingIndex =
+                        {
+                            line = srcLine
+                            column = srcCol
+                        }
+
+                    let targetPath = Path.normalizeFullPath targetPath
+
+                    let sourcePath =
+                        defaultArg file sourcePath
+                        |> Path.getRelativeFileOrDirPath false targetPath false
+
+                    if srcLine <> 0 && srcCol <> 0 && file <> Some "unknown" then
+                        mapGenerator.Force().AddMapping(generated, original, source = sourcePath, ?name = displayName)
 
             member _.AddLog(msg, severity, ?range) =
                 com.AddLog(msg, severity, ?range = range, fileName = com.CurrentFile)
@@ -520,13 +570,7 @@ module Swift =
         interface IDisposable with
             member _.Dispose() = stream.Dispose()
 
-    let compileFile
-        (com: Compiler)
-        (_cliArgs: CliArgs)
-        (_pathResolver: PathResolver)
-        (isSilent: bool)
-        (outPath: string)
-        =
+    let compileFile (com: Compiler) (cliArgs: CliArgs) (pathResolver: PathResolver) (isSilent: bool) (outPath: string) =
         async {
             let! ct = Async.CancellationToken
 
@@ -554,8 +598,9 @@ module Swift =
                     |> Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com
 
             if not (isSilent || Fable.Transforms.Swift.SwiftPrinter.isEmpty file) then
-                use writer = new SwiftWriter(com, outPath, ct)
+                use writer = new SwiftWriter(com, cliArgs, pathResolver, outPath, ct)
                 do! Fable.Transforms.Swift.SwiftPrinter.run writer file
+                do! writer.WriteSourceMapIfEnabled()
         }
 
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =

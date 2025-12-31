@@ -29,17 +29,17 @@ type InMemoryWriter(write: string -> unit) =
     interface IDisposable with
         member _.Dispose() = ()
 
-let private makeCompiler language libraryDir =
+let private makeCompilerWithFile language libraryDir currentFile sourceFiles projectFile =
     let options = CompilerOptionsHelper.Make(language = language)
 
     { new Compiler with
         member _.LibraryDir = libraryDir
-        member _.CurrentFile = ""
+        member _.CurrentFile = currentFile
         member _.OutputDir = None
         member _.OutputType = OutputType.Library
-        member _.ProjectFile = ""
+        member _.ProjectFile = projectFile
         member _.ProjectOptions = invalidOp "Not implemented in test stub"
-        member _.SourceFiles = [||]
+        member _.SourceFiles = sourceFiles
         member _.Options = options
         member _.Plugins = { MemberDeclarationPlugins = Map.empty }
         member _.IncrementCounter() = 0
@@ -52,6 +52,47 @@ let private makeCompiler language libraryDir =
         member _.AddWatchDependency _ = ()
         member _.AddLog(_msg, _severity, ?range, ?fileName, ?tag) = ()
     }
+
+let private makeCompiler language libraryDir =
+    makeCompilerWithFile language libraryDir "" [||] ""
+
+let private makeSwiftCliArgs projectFile rootDir outDir sourceMaps =
+    let usesOutDir =
+        outDir
+        |> Option.map String.IsNullOrWhiteSpace
+        |> Option.defaultValue true
+        |> not
+
+    {
+        ProjectFile = projectFile
+        RootDir = rootDir
+        OutDir = outDir
+        IsWatch = false
+        Precompile = false
+        PrecompiledLib = None
+        PrintAst = false
+        FableLibraryPath = None
+        Configuration = "Debug"
+        NoRestore = true
+        NoCache = true
+        NoParallelTypeCheck = false
+        SourceMaps = sourceMaps
+        SourceMapsRoot = None
+        Exclude = []
+        Replace = Map.empty
+        RunProcess = None
+        CompilerOptions =
+            CompilerOptionsHelper.Make(
+                language = Swift,
+                fileExtension = File.defaultFileExt usesOutDir Swift
+            )
+        Verbosity = Verbosity.Normal
+    }
+
+let private defaultPathResolver =
+    { new PathResolver with
+        member _.TryPrecompiledOutPath(_, _) = None
+        member _.GetOrAddDeduplicateTargetDir(_, addTargetDir) = addTargetDir Set.empty }
 
 let private withTempProject language (testFn: CrackerOptions -> unit) =
     let rootDir = IO.Path.Combine(IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"))
@@ -159,36 +200,10 @@ let tests =
         let outPath = IO.Path.Combine(rootDir, "Test.swift")
 
         let compiler = makeCompiler Swift "lib"
-        let cliArgs: CliArgs =
-            {
-                ProjectFile = ""
-                RootDir = rootDir
-                OutDir = Some rootDir
-                IsWatch = false
-                Precompile = false
-                PrecompiledLib = None
-                PrintAst = false
-                FableLibraryPath = None
-                Configuration = "Debug"
-                NoRestore = true
-                NoCache = true
-                NoParallelTypeCheck = false
-                SourceMaps = false
-                SourceMapsRoot = None
-                Exclude = []
-                Replace = Map.empty
-                RunProcess = None
-                CompilerOptions = CompilerOptionsHelper.Make(language = Swift)
-                Verbosity = Verbosity.Normal
-            }
-
-        let pathResolver =
-            { new PathResolver with
-                member _.TryPrecompiledOutPath(_, _) = None
-                member _.GetOrAddDeduplicateTargetDir(_, addTargetDir) = addTargetDir Set.empty }
+        let cliArgs = makeSwiftCliArgs "" rootDir (Some rootDir) false
 
         try
-            Fable.Cli.Pipeline.Swift.compileFile compiler cliArgs pathResolver false outPath
+            Fable.Cli.Pipeline.Swift.compileFile compiler cliArgs defaultPathResolver false outPath
             |> Async.RunSynchronously
 
             Expect.isTrue (IO.File.Exists(outPath)) "placeholder file exists"
@@ -197,6 +212,68 @@ let tests =
             Expect.stringContains content "Swift backend is not implemented yet" "placeholder content"
             Expect.stringContains content compiler.CurrentFile "includes source path"
             Expect.stringContains content outPath "includes out path"
+        finally
+            if IO.Directory.Exists(rootDir) then
+                IO.Directory.Delete(rootDir, true)
+
+    testCase "Swift compile path emits source map when enabled" <| fun () ->
+        let rootDir = IO.Path.Combine(IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"))
+        let projDir = IO.Path.Combine(rootDir, "proj")
+        let projFile = IO.Path.Combine(projDir, "Test.fsproj")
+        let outPath = IO.Path.Combine(rootDir, "Test.swift")
+
+        IO.Directory.CreateDirectory(projDir) |> ignore
+        IO.File.WriteAllText(projFile, "<Project></Project>")
+
+        let compiler = makeCompiler Swift "lib"
+        let cliArgs = makeSwiftCliArgs projFile projDir (Some rootDir) true
+
+        try
+            Fable.Cli.Pipeline.Swift.compileFile compiler cliArgs defaultPathResolver false outPath
+            |> Async.RunSynchronously
+
+            let mapFileName = IO.Path.GetFileName(outPath) + ".map"
+            let encodedMapFileName = System.Uri.EscapeDataString(mapFileName)
+            Expect.isTrue (IO.File.Exists(outPath + ".map")) "source map exists"
+
+            let content = IO.File.ReadAllText(outPath)
+            Expect.stringContains content $"//# sourceMappingURL={encodedMapFileName}" "source map link"
+        finally
+            if IO.Directory.Exists(rootDir) then
+                IO.Directory.Delete(rootDir, true)
+
+    testCase "Swift writer resolves import paths to outDir" <| fun () ->
+        let rootDir = IO.Path.Combine(IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"))
+        let projDir = IO.Path.Combine(rootDir, "proj")
+        let srcDir = IO.Path.Combine(projDir, "src")
+        let outDir = IO.Path.Combine(rootDir, "out")
+        let projFile = IO.Path.Combine(projDir, "Test.fsproj")
+        let currentFile = IO.Path.Combine(srcDir, "Foo.fs")
+        let outPath = IO.Path.Combine(outDir, "Foo.swift")
+
+        IO.Directory.CreateDirectory(srcDir) |> ignore
+        IO.Directory.CreateDirectory(outDir) |> ignore
+        IO.File.WriteAllText(projFile, "<Project></Project>")
+        IO.File.WriteAllText(currentFile, "module Foo")
+
+        let compiler =
+            makeCompilerWithFile Swift "lib" currentFile [| currentFile |] projFile
+
+        let cliArgs = makeSwiftCliArgs projFile projDir (Some outDir) false
+
+        try
+            use writer =
+                new Fable.Cli.Pipeline.Swift.SwiftWriter(
+                    compiler,
+                    cliArgs,
+                    defaultPathResolver,
+                    outPath,
+                    System.Threading.CancellationToken.None
+                )
+
+            let resolved = (writer :> Printer.Writer).MakeImportPath("./Other.fs")
+
+            Expect.equal resolved "./src/Other.swift" "resolves relative import path"
         finally
             if IO.Directory.Exists(rootDir) then
                 IO.Directory.Delete(rootDir, true)
@@ -332,6 +409,40 @@ let tests =
 
         Expect.equal written expected "renders import, bindings, then function"
 
+    testCase "Swift printer resolves path-like imports through writer" <| fun () ->
+        let mutable written = ""
+
+        let capture =
+            { new Printer.Writer with
+                member _.Write(str) =
+                    written <- str
+                    async.Return()
+
+                member _.MakeImportPath(path) =
+                    "resolved-" + path.Replace(".fs", ".swift")
+
+                member _.AddSourceMapping(_, _, _, _, _, _) = ()
+                member _.AddLog(_msg, _severity, ?range) = ()
+
+              interface IDisposable with
+                member _.Dispose() = () }
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftImport { Module = "Foundation" }
+                        SwiftImport { Module = "./Sources/App.fs" }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "import Foundation"; "import resolved-./Sources/App.swift"; "" ]
+
+        Expect.equal written expected "resolves path imports while keeping module imports"
+
     testCase "Swift printer formats call expressions" <| fun () ->
         let mutable written = ""
         let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
@@ -367,6 +478,30 @@ let tests =
                 [ "let result = foo(bar, 1, \"hi\\nthere\")"; "" ]
 
         Expect.equal written expected "renders call expression"
+
+    testCase "Swift printer escapes quotes and backslashes in string literals" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftBinding
+                            {
+                                Name = "text"
+                                Expr = Some(SwiftStringLiteral "quote \" and \\ backslash")
+                                IsMutable = false
+                            }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "let text = \"quote \\\" and \\\\ backslash\""; "" ]
+
+        Expect.equal written expected "escapes quotes and backslashes"
 
     testCase "Swift transform uses bindings for zero-arg members" <| fun () ->
         let com = makeCompiler Swift "lib"

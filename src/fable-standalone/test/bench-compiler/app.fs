@@ -324,7 +324,9 @@ let parseFiles projectFileName options =
                 if options.sourceMaps then
                     let mapPath = outPath + ".map"
 
-                    let sourceMapUrl = "//# sourceMappingURL=" + Path.GetFileName(mapPath)
+                    let sourceMapUrl =
+                        "//# sourceMappingURL="
+                        + (Path.GetFileName(mapPath) |> System.Uri.EscapeDataString)
 
                     do! (writer :> Fable.Standalone.IWriter).Write(sourceMapUrl)
                     writeAllText mapPath (serializeToJson writer.SourceMap)

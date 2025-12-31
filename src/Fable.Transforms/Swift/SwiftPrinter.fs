@@ -113,7 +113,24 @@ let rec private renderStatement (indent: string) =
         else
             String.concat nl [ openBrace; inner; closeBrace ]
 
-let private renderDeclaration indent =
+let private shouldResolveImportPath (moduleName: string) =
+    if String.IsNullOrWhiteSpace moduleName then
+        false
+    else
+        moduleName.StartsWith(".", StringComparison.Ordinal)
+        || moduleName.StartsWith("$", StringComparison.Ordinal)
+        || moduleName.Contains("/")
+        || moduleName.Contains("\\")
+        || moduleName.EndsWith(".fs", StringComparison.Ordinal)
+        || moduleName.EndsWith(".swift", StringComparison.Ordinal)
+
+let private resolveImportPath (makeImportPath: string -> string) (moduleName: string) =
+    if shouldResolveImportPath moduleName then
+        makeImportPath moduleName
+    else
+        moduleName
+
+let private renderDeclaration indent makeImportPath =
     function
     | SwiftComment text ->
         let body = safe text
@@ -128,7 +145,12 @@ let private renderDeclaration indent =
         if String.IsNullOrWhiteSpace(moduleName) then
             ""
         else
-            indent + $"import {moduleName}"
+            let resolved = resolveImportPath makeImportPath moduleName
+
+            if String.IsNullOrWhiteSpace(resolved) then
+                ""
+            else
+                indent + $"import {resolved}"
     | SwiftBinding bindingDecl -> renderBindingDecl indent bindingDecl
     | SwiftFuncDecl funcDecl ->
         let name = safe funcDecl.Name
@@ -151,12 +173,12 @@ let private renderDeclaration indent =
                 String.concat Environment.NewLine [ header; block ]
     | SwiftStatementDecl stmt -> renderStatement indent stmt
 
-let private renderFile (file: SwiftFile) =
+let private renderFile makeImportPath (file: SwiftFile) =
     let sb = StringBuilder()
 
     file.Declarations
     |> List.iter (fun decl ->
-        let line = renderDeclaration "" decl
+        let line = renderDeclaration "" makeImportPath decl
 
         if not (String.IsNullOrWhiteSpace line) then
             // TODO: extend with additional declaration kinds as Swift AST grows.
@@ -168,6 +190,6 @@ let private renderFile (file: SwiftFile) =
 let run (writer: Writer) (file: SwiftFile) =
     async {
         if not (isEmpty file) then
-            let output = renderFile file
+            let output = renderFile writer.MakeImportPath file
             do! writer.Write(output)
     }
