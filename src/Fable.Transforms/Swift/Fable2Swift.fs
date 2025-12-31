@@ -27,6 +27,14 @@ let private unsupportedExprFallback =
 let private unsupportedBindingFallback =
     SwiftLiteral $"fatalError(\"{warningPrefix}: unsupported binding value\")"
 
+type private StderrAnalysis =
+    {
+        NeedsStderrPrint: bool
+        HasStderrHelper: bool
+        HasFoundationImport: bool
+        LastImportIndex: int option
+    }
+
 let placeholderFile sourceFile outPath : SwiftFile =
     let lines = [ placeholderMessage; $"Source: {sourceFile}"; $"Out: {outPath}" ]
 
@@ -88,8 +96,77 @@ let private tryTransformValue =
     | UnitConstant -> SwiftLiteral("()") |> Some
     | _ -> None
 
+let private isStringLibraryMember memberName (info: ImportInfo) =
+    match info.Kind with
+    | LibraryImport _ ->
+        info.Selector = memberName
+        && info.Path.EndsWith("/String.swift", StringComparison.Ordinal)
+    | _ -> false
+
+let private isSimplePrintfFormat (formatText: string) =
+    match formatText with
+    | "%s"
+    | "%i"
+    | "%d"
+    | "%f"
+    | "%O"
+    | "%A" -> true
+    | _ -> false
+
+let private stdoutPrintIdentifier = SwiftIdentifier "print"
+let private stderrPrintName = "stderrPrint"
+let private stderrPrintIdentifier = SwiftIdentifier stderrPrintName
+
+let private tryGetPrintTarget name =
+    match name with
+    | "printf"
+    | "printfn" -> Some stdoutPrintIdentifier
+    | "eprintf"
+    | "eprintfn" -> Some stderrPrintIdentifier
+    | _ -> None
+
+let rec private tryGetCalleeName =
+    function
+    | IdentExpr ident -> Some ident.Name
+    | Import(info, _, _) -> Some info.Selector
+    | Get(_, FieldGet info, _, _) -> Some info.Name
+    | Get(_, ExprGet(Value(StringConstant name, _)), _, _) -> Some name
+    | TypeCast(expr, _) -> tryGetCalleeName expr
+    | _ -> None
+
+let rec private stripTypeCast =
+    function
+    | TypeCast(expr, _) -> stripTypeCast expr
+    | expr -> expr
+
+let private tryGetStringConstant expr =
+    match stripTypeCast expr with
+    | Value(StringConstant value, _) -> Some value
+    | _ -> None
+
+let private tryGetPrintfFormat expr =
+    match stripTypeCast expr with
+    | Call(callee, callInfo, _, _) ->
+        match tryGetCalleeName callee, callInfo.Args with
+        | Some "printf", [ arg ] -> tryGetStringConstant arg
+        | _ -> None
+    | CurriedApply(applied, args, _, _) ->
+        match tryGetCalleeName applied, args with
+        | Some "printf", [ arg ] -> tryGetStringConstant arg
+        | _ -> None
+    | _ -> None
+
+let private tryGetConsoleTarget (info: ImportInfo) =
+    if isStringLibraryMember "toConsole" info then
+        Some stdoutPrintIdentifier
+    elif isStringLibraryMember "toConsoleError" info then
+        Some stderrPrintIdentifier
+    else
+        None
+
 let rec private tryTransformExpr =
     function
+    | Import(info, _, _) -> tryGetConsoleTarget info
     | IdentExpr ident -> SwiftIdentifier ident.Name |> Some
     | Value(kind, _) -> tryTransformValue kind
     | TypeCast(expr, _) -> tryTransformExpr expr
@@ -101,18 +178,36 @@ let rec private tryTransformExpr =
             | FieldGet info -> SwiftMemberAccess(target, info.Name) |> Some
             | TupleIndex index -> SwiftMemberAccess(target, string index) |> Some
             | _ -> None
-    | Call(callee, info, _, _) ->
-        let calleeExpr =
-            match info.ThisArg, callee with
-            | Some thisArg, IdentExpr ident ->
-                match tryTransformExpr thisArg with
-                | Some target -> SwiftMemberAccess(target, ident.Name) |> Some
-                | None -> None
-            | _ -> tryTransformExpr callee
+    | Call(Import(info, _, _), callInfo, _, _) ->
+        match tryGetConsoleTarget info with
+        | Some target -> tryTransformConsoleCall target callInfo.Args
+        | None -> None
+    | CurriedApply(Call(Import(info, _, _), callInfo, _, _), args, _, _) ->
+        match tryGetConsoleTarget info with
+        | Some target -> tryTransformConsoleCall target (callInfo.Args @ args)
+        | None -> None
+    | Call(callee, callInfo, _, _) ->
+        match tryGetCalleeName callee |> Option.bind tryGetPrintTarget with
+        | Some target -> tryTransformConsoleCall target callInfo.Args
+        | _ ->
+            let calleeExpr =
+                match callInfo.ThisArg, callee with
+                | Some thisArg, IdentExpr ident ->
+                    match tryTransformExpr thisArg with
+                    | Some target -> SwiftMemberAccess(target, ident.Name) |> Some
+                    | None -> None
+                | _ -> tryTransformExpr callee
 
-        match calleeExpr, tryTransformArgs info.Args with
-        | Some target, Some args -> SwiftCall(target, args) |> Some
-        | _ -> None
+            match calleeExpr, tryTransformArgs callInfo.Args with
+            | Some target, Some args -> SwiftCall(target, args) |> Some
+            | _ -> None
+    | CurriedApply(Call(callee, callInfo, callType, callRange), args, _, _) ->
+        match tryGetCalleeName callee |> Option.bind tryGetPrintTarget with
+        | Some target -> tryTransformConsoleCall target (callInfo.Args @ args)
+        | _ ->
+            match tryTransformExpr (Call(callee, callInfo, callType, callRange)), tryTransformArgs args with
+            | Some target, Some args -> SwiftCall(target, args) |> Some
+            | _ -> None
     | CurriedApply(applied, args, _, _) ->
         match tryTransformExpr applied, tryTransformArgs args with
         | Some target, Some args -> SwiftCall(target, args) |> Some
@@ -126,6 +221,35 @@ and private tryTransformArgs args =
         None
     else
         transformed |> List.choose id |> Some
+
+and private tryTransformPrintArg expr =
+    match tryGetPrintfFormat expr with
+    | Some formatText -> SwiftStringLiteral formatText |> Some
+    | None -> tryTransformExpr expr
+
+and private tryTransformPrintArgs args =
+    let args =
+        match args with
+        | first :: rest when rest.Length = 1 ->
+            match stripTypeCast first with
+            | Value(StringConstant formatText, _) when isSimplePrintfFormat formatText -> rest
+            | _ ->
+                match tryGetPrintfFormat first with
+                | Some formatText when isSimplePrintfFormat formatText -> rest
+                | _ -> args
+        | _ -> args
+
+    let transformed = args |> List.map tryTransformPrintArg
+
+    if transformed |> List.exists Option.isNone then
+        None
+    else
+        transformed |> List.choose id |> Some
+
+and private tryTransformConsoleCall target args =
+    match tryTransformPrintArgs args with
+    | Some swiftArgs -> SwiftCall(target, swiftArgs) |> Some
+    | None -> None
 
 let private addSwiftWarning (com: Compiler) range message =
     addWarning com [] range $"{warningPrefix}: {message}"
@@ -264,4 +388,101 @@ module Compiler =
 
     let transformFile (com: Compiler) (file: File) : SwiftFile =
         let declarations = file.Declarations |> List.collect (transformDeclaration com)
+
+        let rec exprUsesStderrPrint =
+            function
+            | SwiftCall(callee, args) ->
+                match callee with
+                | SwiftIdentifier name when name = stderrPrintName -> true
+                | _ -> exprUsesStderrPrint callee || (args |> List.exists exprUsesStderrPrint)
+            | SwiftMemberAccess(expr, _) -> exprUsesStderrPrint expr
+            | _ -> false
+
+        let rec statementUsesStderrPrint =
+            function
+            | SwiftExpr expr -> exprUsesStderrPrint expr
+            | SwiftReturn(Some expr) -> exprUsesStderrPrint expr
+            | SwiftReturn None -> false
+            | SwiftBindingStatement binding -> binding.Expr |> Option.exists exprUsesStderrPrint
+            | SwiftBlock statements -> statements |> List.exists statementUsesStderrPrint
+
+        let declarationUsesStderrPrint =
+            function
+            | SwiftBinding binding -> binding.Expr |> Option.exists exprUsesStderrPrint
+            | SwiftStatementDecl stmt -> statementUsesStderrPrint stmt
+            | SwiftFuncDecl funcDecl -> funcDecl.Body |> List.exists statementUsesStderrPrint
+            | _ -> false
+
+        let analyzeDeclaration index analysis declaration =
+            let needsStderrPrint =
+                analysis.NeedsStderrPrint || declarationUsesStderrPrint declaration
+
+            let hasStderrHelper =
+                analysis.HasStderrHelper
+                || match declaration with
+                   | SwiftFuncDecl funcDecl when funcDecl.Name = stderrPrintName -> true
+                   | _ -> false
+
+            let hasFoundationImport =
+                analysis.HasFoundationImport
+                || match declaration with
+                   | SwiftImport importDecl when importDecl.Module = "Foundation" -> true
+                   | _ -> false
+
+            let lastImportIndex =
+                match declaration with
+                | SwiftImport _ -> Some index
+                | _ -> analysis.LastImportIndex
+
+            {
+                NeedsStderrPrint = needsStderrPrint
+                HasStderrHelper = hasStderrHelper
+                HasFoundationImport = hasFoundationImport
+                LastImportIndex = lastImportIndex
+            }
+
+        let analysis =
+            declarations
+            |> List.mapi (fun index declaration -> index, declaration)
+            |> List.fold
+                (fun state (index, declaration) -> analyzeDeclaration index state declaration)
+                {
+                    NeedsStderrPrint = false
+                    HasStderrHelper = false
+                    HasFoundationImport = false
+                    LastImportIndex = None
+                }
+
+        let declarations =
+            if analysis.NeedsStderrPrint && not analysis.HasStderrHelper then
+                let helperBody =
+                    [
+                        SwiftExpr(
+                            SwiftLiteral
+                                "FileHandle.standardError.write(Data((String(describing: value) + \"\\n\").utf8))"
+                        )
+                    ]
+
+                let helperDecl =
+                    SwiftFuncDecl
+                        {
+                            Name = stderrPrintName
+                            Parameters = [ "_ value: Any" ]
+                            Body = helperBody
+                        }
+
+                let helperImports =
+                    if analysis.HasFoundationImport then
+                        []
+                    else
+                        [ SwiftImport { Module = "Foundation" } ]
+
+                match analysis.LastImportIndex with
+                | Some lastIndex ->
+                    let prefix, suffix = declarations |> List.splitAt (lastIndex + 1)
+                    prefix @ helperImports @ (helperDecl :: suffix)
+                | None -> helperImports @ (helperDecl :: declarations)
+            else
+                declarations
+
         { Declarations = declarations }

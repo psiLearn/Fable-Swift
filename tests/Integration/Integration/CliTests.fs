@@ -540,4 +540,37 @@ let tests =
             Expect.equal binding.Expr (Some(SwiftLiteral "42")) "binding value"
         | declarations ->
             failtestf "Expected single SwiftBinding, got %A" declarations
+
+    testCase "Swift transform maps toConsoleError to stderrPrint" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let expr =
+            Fable.Transforms.Replacements.Util.Helper.LibCall(
+                com,
+                "String",
+                "toConsoleError",
+                Fable.AST.Fable.Unit,
+                [ Fable.AST.Fable.Value(Fable.AST.Fable.StringConstant "oops", None) ]
+            )
+
+        let decl =
+            Fable.AST.Fable.ActionDeclaration
+                {
+                    Body = expr
+                    UsedNames = Set.empty
+                }
+
+        let file = Fable.AST.Fable.File([ decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | SwiftImport importDecl
+            :: SwiftFuncDecl funcDecl
+            :: SwiftStatementDecl (SwiftExpr (SwiftCall(SwiftIdentifier name, _)))
+            :: _ ->
+            Expect.equal importDecl.Module "Foundation" "adds Foundation import"
+            Expect.equal funcDecl.Name "stderrPrint" "adds stderr print helper"
+            Expect.equal name "stderrPrint" "uses stderrPrint call"
+        | declarations ->
+            failtestf "Expected stderrPrint helper and call, got %A" declarations
   ]
