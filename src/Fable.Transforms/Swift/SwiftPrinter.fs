@@ -36,6 +36,36 @@ let rec private renderExpression =
     | SwiftIdentifier name -> safe name
     | SwiftLiteral literal -> safe literal
     | SwiftStringLiteral text -> $"\"{escapeStringLiteral (safe text)}\""
+    | SwiftBinary(left, op, right) ->
+        let leftText = renderExpression left
+        let rightText = renderExpression right
+
+        let opText =
+            match op with
+            | SwiftEqual -> "=="
+            | SwiftNotEqual -> "!="
+            | SwiftLess -> "<"
+            | SwiftLessOrEqual -> "<="
+            | SwiftGreater -> ">"
+            | SwiftGreaterOrEqual -> ">="
+            | SwiftLogicalOr -> "||"
+            | SwiftLogicalAnd -> "&&"
+
+        let wrapIfBinary expr text =
+            match expr with
+            | SwiftBinary _ -> $"({text})"
+            | _ -> text
+
+        if
+            String.IsNullOrWhiteSpace(leftText)
+            || String.IsNullOrWhiteSpace(rightText)
+            || String.IsNullOrWhiteSpace(opText)
+        then
+            ""
+        else
+            let leftRendered = wrapIfBinary left leftText
+            let rightRendered = wrapIfBinary right rightText
+            $"{leftRendered} {opText} {rightRendered}"
     | SwiftMemberAccess(expr, memberName) ->
         let target = renderExpression expr
         let memberText = safe memberName

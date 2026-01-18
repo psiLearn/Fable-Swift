@@ -4,6 +4,7 @@ open System
 open System.Globalization
 open System.Numerics
 open Fable
+open Fable.AST
 open Fable.AST.Fable
 open Fable.AST.Swift
 open Fable.Transforms
@@ -96,6 +97,54 @@ let private tryTransformValue =
     | UnitConstant -> SwiftLiteral("()") |> Some
     | _ -> None
 
+let private tryMapBinaryOperator =
+    function
+    | BinaryEqual -> Some SwiftEqual
+    | BinaryUnequal -> Some SwiftNotEqual
+    | BinaryLess -> Some SwiftLess
+    | BinaryLessOrEqual -> Some SwiftLessOrEqual
+    | BinaryGreater -> Some SwiftGreater
+    | BinaryGreaterOrEqual -> Some SwiftGreaterOrEqual
+    | _ -> None
+
+let private tryMapLogicalOperator =
+    function
+    | LogicalOr -> Some SwiftLogicalOr
+    | LogicalAnd -> Some SwiftLogicalAnd
+
+let private isEqualityComparableType =
+    function
+    | Boolean
+    | Char
+    | String
+    | Number _ -> true
+    | _ -> false
+
+let private isRelationalComparableType =
+    function
+    | Char
+    | String
+    | Number _ -> true
+    | _ -> false
+
+let private canApplyBinaryOperator op leftType rightType =
+    if leftType <> rightType then
+        false
+    else
+        match op with
+        | BinaryEqual
+        | BinaryUnequal -> isEqualityComparableType leftType
+        | BinaryLess
+        | BinaryLessOrEqual
+        | BinaryGreater
+        | BinaryGreaterOrEqual -> isRelationalComparableType leftType
+        | _ -> false
+
+let private canApplyLogicalOperator leftType rightType =
+    match leftType, rightType with
+    | Boolean, Boolean -> true
+    | _ -> false
+
 let private isStringLibraryMember memberName (info: ImportInfo) =
     match info.Kind with
     | LibraryImport _ ->
@@ -170,6 +219,23 @@ let rec private tryTransformExpr =
     | IdentExpr ident -> SwiftIdentifier ident.Name |> Some
     | Value(kind, _) -> tryTransformValue kind
     | TypeCast(expr, _) -> tryTransformExpr expr
+    | Operation(kind, _, _, _) ->
+        match kind with
+        | Binary(op, left, right) ->
+            match tryMapBinaryOperator op with
+            | Some opToken when canApplyBinaryOperator op left.Type right.Type ->
+                match tryTransformExpr left, tryTransformExpr right with
+                | Some leftExpr, Some rightExpr -> SwiftBinary(leftExpr, opToken, rightExpr) |> Some
+                | _ -> None
+            | _ -> None
+        | Logical(op, left, right) ->
+            match tryMapLogicalOperator op with
+            | Some opToken when canApplyLogicalOperator left.Type right.Type ->
+                match tryTransformExpr left, tryTransformExpr right with
+                | Some leftExpr, Some rightExpr -> SwiftBinary(leftExpr, opToken, rightExpr) |> Some
+                | _ -> None
+            | _ -> None
+        | _ -> None
     | Get(expr, kind, _, _) ->
         match tryTransformExpr expr with
         | None -> None

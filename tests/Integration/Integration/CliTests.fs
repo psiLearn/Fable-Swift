@@ -479,6 +479,37 @@ let tests =
 
         Expect.equal written expected "renders call expression"
 
+    testCase "Swift printer parenthesizes nested binary expressions" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftBinding
+                            {
+                                Name = "result"
+                                Expr =
+                                    Some(
+                                        SwiftBinary(
+                                            SwiftBinary(SwiftIdentifier "a", SwiftLogicalAnd, SwiftIdentifier "b"),
+                                            SwiftEqual,
+                                            SwiftBinary(SwiftIdentifier "c", SwiftLogicalOr, SwiftIdentifier "d")
+                                        )
+                                    )
+                                IsMutable = false
+                            }
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "let result = (a && b) == (c || d)"; "" ]
+
+        Expect.equal written expected "parenthesizes nested binary expressions"
+
     testCase "Swift printer escapes quotes and backslashes in string literals" <| fun () ->
         let mutable written = ""
         let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer

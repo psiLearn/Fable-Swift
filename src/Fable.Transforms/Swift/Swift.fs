@@ -1,11 +1,22 @@
 module rec Fable.AST.Swift
 
 /// Minimal Swift AST scaffold to unblock backend wiring.
+type SwiftBinaryOperator =
+    | SwiftEqual
+    | SwiftNotEqual
+    | SwiftLess
+    | SwiftLessOrEqual
+    | SwiftGreater
+    | SwiftGreaterOrEqual
+    | SwiftLogicalOr
+    | SwiftLogicalAnd
+
 type SwiftExpression =
     | SwiftIdentifier of string
     | SwiftLiteral of string
     | SwiftStringLiteral of string
     | SwiftMemberAccess of SwiftExpression * string
+    | SwiftBinary of SwiftExpression * SwiftBinaryOperator * SwiftExpression
     | SwiftCall of SwiftExpression * SwiftExpression list
 
 type SwiftBlock = SwiftStatement list
