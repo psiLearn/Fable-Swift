@@ -21,18 +21,18 @@ let (|TypedArrayCompatible|_|) (com: Compiler) (arrayKind: ArrayKind) t =
     | ResizeArray, _ -> None
     | _, Number(kind, _) when com.Options.TypedArrays ->
         match kind with
-        | Int8 -> Some "Int8Array"
-        | UInt8 -> Some "Uint8Array"
-        | Int16 -> Some "Int16Array"
-        | UInt16 -> Some "Uint16Array"
-        | Int32 -> Some "Int32Array"
-        | UInt32 -> Some "Uint32Array"
-        | Float32 -> Some "Float32Array"
-        | Float64 -> Some "Float64Array"
+        | Int8 -> Some "Int8ArrayCons"
+        | UInt8 -> Some "UInt8ArrayCons"
+        | Int16 -> Some "Int16ArrayCons"
+        | UInt16 -> Some "UInt16ArrayCons"
+        | Int32 -> Some "Int32ArrayCons"
+        | UInt32 -> Some "UInt32ArrayCons"
+        | Float32 -> Some "Float32ArrayCons"
+        | Float64 -> Some "Float64ArrayCons"
         // Don't use typed array for int64 until we remove our int64 polyfill
         // and use JS BigInt to represent int64
-        //        | Int64 -> Some "BigInt64Array"
-        //        | UInt64 -> Some "BigUint64Array"
+        //        | Int64 -> Some "BigInt64ArrayCons"
+        //        | UInt64 -> Some "BigUint64ArrayCons"
         | Int128
         | UInt128
         | Float16
@@ -47,15 +47,32 @@ let (|TypedArrayCompatible|_|) (com: Compiler) (arrayKind: ArrayKind) t =
 let error com msg =
     Helper.ConstructorCall(makeIdentExpr "Exception", Any, [ msg ])
 
-/// Wraps ResizeArray (Python list) arguments with to_enumerable for Seq module compatibility.
-let wrapResizeArrayToEnumerable com (arg: Expr) =
+/// Wraps String arguments with to_enumerable for Seq module compatibility.
+/// Python strings don't implement IEnumerable_1, so they need to be wrapped when used as sequences.
+let wrapStringToEnumerable com (arg: Expr) =
     let rec getInnerType expr =
         match expr with
         | TypeCast(inner, _) -> getInnerType inner
         | _ -> expr.Type
 
     match getInnerType arg with
-    | Array(_, ResizeArray) -> Helper.LibCall(com, "util", "to_enumerable", arg.Type, [ arg ])
+    | String -> Helper.LibCall(com, "util", "to_enumerable", arg.Type, [ arg ])
+    | _ -> arg
+
+/// Wraps IDictionary/Dictionary arguments with to_enumerable(dict.items()) for Seq module compatibility.
+/// When iterating over a dictionary in F#, you get KeyValuePair items, but Python dict
+/// iteration yields keys only. Calling .items() gives us the key-value pairs, and
+/// to_enumerable wraps it as IEnumerable_1 for proper type compatibility.
+/// Note: Only wraps direct dict args, not those already wrapped in TypeCast (handled by transformCast).
+let wrapDictToItems com (arg: Expr) =
+    match arg.Type with
+    | DeclaredType(ent, [ keyType; valueType ]) when ent.FullName = Types.idictionary || ent.FullName = Types.dictionary ->
+        // First call .items() on the dict, then wrap with to_enumerable
+        let tupleType = Tuple([ keyType; valueType ], false)
+        let itemsReturnType = makeRuntimeType [ tupleType ] Types.ienumerableGeneric
+        let itemsCall = Helper.InstanceCall(arg, "items", itemsReturnType, [])
+        // Wrap with to_enumerable to get IEnumerable_1
+        Helper.LibCall(com, "util", "to_enumerable", itemsReturnType, [ itemsCall ])
     | _ -> arg
 
 let coreModFor =
@@ -69,7 +86,7 @@ let coreModFor =
     | FSharpMap _ -> "map"
     | FSharpResult _ -> "result"
     | FSharpChoice _ -> "choice"
-    | FSharpReference _ -> "types"
+    | FSharpReference _ -> "core"
     | BclHashSet _ -> "mutable_set"
     | BclDictionary _ -> "mutable_map"
     | BclKeyValuePair _
@@ -88,9 +105,13 @@ let makeDecimalFromExpr com r t (e: Expr) =
     | Value(Fable.NumberConstant(NumberValue.Decimal x, _), _) -> makeDecimal com r t x
     | _ -> Helper.LibCall(com, "decimal_", "create", t, [ e ], isConstructor = true, ?loc = r)
 
+let makeAtomType genArg =
+    makeDeclaredType "Fable.Library.Python" [ genArg ] "Fable.Library.Python.Atom"
+
 let createAtom com (value: Expr) =
     let typ = value.Type
-    Helper.LibCall(com, "util", "create_atom", typ, [ value ], [ typ ])
+    let atomType = makeAtomType typ
+    Helper.LibCall(com, "util", "create_atom", atomType, [ value ], [ typ ])
 
 let getRefCell com r typ (expr: Expr) = getFieldWith r typ expr "contents"
 
@@ -99,7 +120,7 @@ let setRefCell com r (expr: Expr) (value: Expr) =
 
 let makeRefCell com r genArg args =
     let typ = makeFSharpCoreType [ genArg ] Types.refCell
-    Helper.LibCall(com, "types", "FSharpRef", typ, args, isConstructor = true, ?loc = r)
+    Helper.LibCall(com, "core", "FSharpRef", typ, args, isConstructor = true, ?loc = r)
 
 let makeRefCellFromValue com r (value: Expr) =
     let typ = value.Type
@@ -166,6 +187,19 @@ let getParseParams (kind: NumberKind) =
 
     isFloatOrDecimal, numberModule, unsigned, bitsize
 
+/// Gets the type name for calling static parse methods on integer types
+let getIntTypeName (kind: NumberKind) =
+    match kind with
+    | Int8 -> "int8"
+    | UInt8 -> "uint8"
+    | Int16 -> "int16"
+    | UInt16 -> "uint16"
+    | Int32 -> "int32"
+    | UInt32 -> "uint32"
+    | Int64 -> "int64"
+    | UInt64 -> "uint64"
+    | x -> FableError $"Unexpected kind in getIntTypeName: %A{x}" |> raise
+
 let castBigIntMethod typeTo =
     match typeTo with
     | Number(kind, _) ->
@@ -221,7 +255,14 @@ let toFloat com (ctx: Context) r targetType (args: Expr list) : Expr =
     | Char ->
         //Helper.InstanceCall(args.Head, "charCodeAt", Int32.Number, [ makeIntConst 0 ])
         Helper.LibCall(com, "char", "char_code_at", targetType, [ args.Head; makeIntConst 0 ])
-    | String -> Helper.LibCall(com, "double", "parse", targetType, args)
+    | String ->
+        // Use parse_single for Float32, parse for Float64
+        let meth =
+            match targetType with
+            | Number(Float32, _) -> "parse_single"
+            | _ -> "parse"
+
+        Helper.LibCall(com, "double", meth, targetType, args)
     | Number(kind, _) ->
         match kind with
         | BigInt -> Helper.LibCall(com, "big_int", castBigIntMethod targetType, targetType, args)
@@ -250,16 +291,17 @@ let toDecimal com (ctx: Context) r targetType (args: Expr list) : Expr =
         TypeCast(args.Head, targetType)
 
 
-let stringToInt com (ctx: Context) r targetType (args: Expr list) : Expr =
+let stringToInt com (_ctx: Context) r targetType (args: Expr list) : Expr =
     let kind =
         match targetType with
         | Number(kind, _) -> kind
         | x -> FableError $"Unexpected type in stringToInt: %A{x}" |> raise
 
     let style = int System.Globalization.NumberStyles.Any
-    let _isFloatOrDecimal, numberModule, unsigned, bitsize = getParseParams kind
-    let parseArgs = [ makeIntConst style; makeBoolConst unsigned; makeIntConst bitsize ]
-    Helper.LibCall(com, numberModule, "parse", targetType, [ args.Head ] @ parseArgs @ args.Tail, ?loc = r)
+    // Use the type's static parse method: e.g., int8.parse(string, style)
+    let typeName = getIntTypeName kind
+    let typeExpr = Helper.LibValue(com, "core", typeName, Any)
+    Helper.InstanceCall(typeExpr, "parse", targetType, [ args.Head; makeIntConst style ] @ args.Tail, ?loc = r)
 
 let toLong com (ctx: Context) r (unsigned: bool) targetType (args: Expr list) : Expr =
     let fromInteger kind arg =
@@ -304,12 +346,12 @@ let toInt com (ctx: Context) r targetType (args: Expr list) =
 
     let emitCast typeTo arg =
         match typeTo with
-        | Int8 -> Helper.LibCall(com, "types", "sbyte", targetType, [ arg ])
-        | Int16 -> Helper.LibCall(com, "types", "int16", targetType, [ arg ])
-        | Int32 -> Helper.LibCall(com, "types", "int32", targetType, [ arg ])
-        | UInt8 -> Helper.LibCall(com, "types", "byte", targetType, [ arg ])
-        | UInt16 -> Helper.LibCall(com, "types", "uint16", targetType, [ arg ])
-        | UInt32 -> Helper.LibCall(com, "types", "uint32", targetType, [ arg ])
+        | Int8 -> Helper.LibCall(com, "core", "sbyte", targetType, [ arg ])
+        | Int16 -> Helper.LibCall(com, "core", "int16", targetType, [ arg ])
+        | Int32 -> Helper.LibCall(com, "core", "int32", targetType, [ arg ])
+        | UInt8 -> Helper.LibCall(com, "core", "byte", targetType, [ arg ])
+        | UInt16 -> Helper.LibCall(com, "core", "uint16", targetType, [ arg ])
+        | UInt32 -> Helper.LibCall(com, "core", "uint32", targetType, [ arg ])
         | _ ->
             // Use normal Python int for BigInt, NativeInt, UNativeInt
             Helper.GlobalCall("int", targetType, [ arg ])
@@ -324,7 +366,7 @@ let toInt com (ctx: Context) r targetType (args: Expr list) =
         if needToCast typeFrom typeTo then
             match typeFrom with
             | Int64
-            | UInt64 -> Helper.LibCall(com, "types", "int32", targetType, args)
+            | UInt64 -> Helper.LibCall(com, "core", "int32", targetType, args)
             | Decimal -> Helper.LibCall(com, "Decimal", "to_int", targetType, args)
             | _ -> args.Head
             |> emitCast typeTo
@@ -354,7 +396,7 @@ let toString com (ctx: Context) r (args: Expr list) =
         | Builtin BclGuid when tail.IsEmpty -> Helper.GlobalCall("str", String, [ head ], ?loc = r)
         | Builtin(BclGuid | BclTimeSpan as bt) -> Helper.LibCall(com, coreModFor bt, "to_string", String, args)
         | Number(Int32, _) ->
-            let expr = Helper.LibCall(com, "types", "int32", head.Type, [ head ], ?loc = r)
+            let expr = Helper.LibCall(com, "core", "int32", head.Type, [ head ], ?loc = r)
             Helper.InstanceCall(expr, "to_string", String, tail, ?loc = r)
         | Number((Int8 | UInt8 | UInt16 | Int16 | UInt32 | Int64 | UInt64), _) ->
             if tail.Length > 0 then
@@ -363,13 +405,13 @@ let toString com (ctx: Context) r (args: Expr list) =
                 Helper.GlobalCall("str", String, [ head ], ?loc = r)
         | Number(BigInt, _) -> Helper.LibCall(com, "util", "int_to_string", String, args)
         | Number(Decimal, _) -> Helper.LibCall(com, "decimal", "to_string", String, args)
-        | Number _ -> Helper.LibCall(com, "types", "to_string", String, [ head ], ?loc = r)
+        | Number _ -> Helper.LibCall(com, "exceptions", "to_string", String, [ head ], ?loc = r)
         | Array _
-        | List _ -> Helper.LibCall(com, "types", "seqToString", String, [ head ], ?loc = r)
+        | List _ -> Helper.LibCall(com, "exceptions", "seq_to_string", String, [ head ], ?loc = r)
         // | DeclaredType(ent, _) when ent.IsFSharpUnion || ent.IsFSharpRecord || ent.IsValueType ->
         //     Helper.InstanceCall(head, "toString", String, [], ?loc=r)
         // | DeclaredType(ent, _) ->
-        | _ -> Helper.LibCall(com, "types", "toString", String, [ head ], ?loc = r)
+        | _ -> Helper.LibCall(com, "exceptions", "to_string", String, [ head ], ?loc = r)
 
 let round com (args: Expr list) =
     match args.Head.Type with
@@ -672,7 +714,8 @@ let makeDictionary (com: ICompiler) ctx r t sourceSeq =
     | DeclaredType(_, [ key; _ ]) when not (isCompatibleWithNativeComparison key) ->
         // makeComparer com ctx key
         makeEqualityComparer com ctx key |> makeDictionaryWithComparer com r t sourceSeq
-    | _ -> Helper.GlobalCall("dict", t, [ sourceSeq ], isConstructor = true, ?loc = r)
+    // Use make_dict which handles both Python iterables and Fable IEnumerable_1
+    | _ -> Helper.LibCall(com, "map_util", "make_dict", t, [ sourceSeq ], ?loc = r)
 
 let makeHashSetWithComparer com r t sourceSeq comparer =
     Helper.LibCall(com, "mutable_set", "HashSet", t, [ sourceSeq; comparer ], isConstructor = true, ?loc = r)
@@ -774,9 +817,12 @@ let tryEntityIdent (com: Compiler) entFullName =
     | BuiltinDefinition BclDateTimeOffset -> makeIdentExpr "Date" |> Some
     | BuiltinDefinition BclTimer -> makeImportLib com Any "default" "Timer" |> Some
     | BuiltinDefinition(FSharpReference _) -> makeImportLib com Any "FSharpRef" "Types" |> Some
-    | BuiltinDefinition(FSharpResult _) -> makeImportLib com Any "FSharpResult_2" "Result" |> Some
+    | BuiltinDefinition(FSharpResult _) ->
+        // Import the underscore-prefixed base class (has cases() method), not the type alias
+        makeImportLib com Any "_FSharpResult_2" "Result" |> Some
     | BuiltinDefinition(FSharpChoice genArgs) ->
-        let membName = $"FSharpChoice_{List.length genArgs}"
+        // Import the underscore-prefixed base class (has cases() method), not the type alias
+        let membName = $"_FSharpChoice_%d{List.length genArgs}"
         makeImportLib com Any membName "Choice" |> Some
     // | BuiltinDefinition BclGuid -> jsTypeof "string" expr
     // | BuiltinDefinition BclTimeSpan -> jsTypeof "number" expr
@@ -797,7 +843,13 @@ let tryConstructor com (ent: Entity) =
     if FSharp2Fable.Util.isReplacementCandidate ent.Ref then
         tryEntityIdent com (ent.FullName |> Naming.toPythonNaming)
     else
-        FSharp2Fable.Util.tryEntityIdentMaybeGlobalOrImported com ent
+        match FSharp2Fable.Util.tryEntityIdentMaybeGlobalOrImported com ent with
+        | Some(IdentExpr ident) when ent.IsFSharpUnion ->
+            // For F# union types, the base class is prefixed with underscore (_UnionName)
+            // This is needed for both reflection (base class has cases() method) and
+            // type annotations (self inside base class methods)
+            Some(IdentExpr { ident with Name = "_" + ident.Name })
+        | other -> other
 
 let constructor com ent =
     match tryConstructor com ent with
@@ -811,8 +863,8 @@ let tryCoreOp com r t coreModule coreMember args =
     let op = Helper.LibValue(com, coreModule, coreMember, Any)
     tryOp com r t op args
 
-let emptyGuid () =
-    makeStrConst "00000000-0000-0000-0000-000000000000"
+let emptyGuid com t =
+    Helper.LibCall(com, "guid", "parse", t, [ makeStrConst "00000000-0000-0000-0000-000000000000" ])
 
 let rec defaultof com ctx r t =
     match t with
@@ -823,7 +875,7 @@ let rec defaultof com ctx r t =
     | Builtin BclTimeSpan
     | Builtin BclDateTime
     | Builtin BclDateTimeOffset -> getZero com ctx t
-    | Builtin BclGuid -> emptyGuid ()
+    | Builtin BclGuid -> emptyGuid com t
     | DeclaredType(ent, _) ->
         let ent = com.GetEntity(ent)
         // TODO: For BCL types we cannot access the constructor, raise error or warning?
@@ -1070,11 +1122,11 @@ let operators (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr o
             match genArg with
             | Char -> "Range", "rangeChar", args
             | Number(Decimal, _) -> "Range", "rangeDecimal", addStep args
-            | Number(BigInt, _)
-            | Number(Int32, _)
-            | Number(UInt32, _) -> "Range", "range_big_int", addStep args
-            | Number(Int64, _)
-            | Number(UInt64, _) -> "Range", "range_int64", addStep args
+            | Number(BigInt, _) -> "Range", "range_big_int", addStep args
+            | Number(Int32, _) -> "Range", "range_int32", addStep args
+            | Number(UInt32, _) -> "Range", "range_uint32", addStep args
+            | Number(Int64, _) -> "Range", "range_int64", addStep args
+            | Number(UInt64, _) -> "Range", "range_uint64", addStep args
             | _ -> "Range", "rangeDouble", addStep args
 
         Helper.LibCall(com, modul, meth, t, args, i.SignatureArgTypes, ?loc = r) |> Some
@@ -1201,6 +1253,9 @@ let operators (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr o
             |> Some
         | ExprType(Number((Float16 | Float32 | Float64), _)) :: _ ->
             Helper.LibCall(com, "double", "sign", t, args, i.SignatureArgTypes, ?thisArg = thisArg, ?loc = r)
+            |> Some
+        | ExprType(Number(Int32, _)) :: _ ->
+            Helper.LibCall(com, "int32", "sign", t, args, i.SignatureArgTypes, ?thisArg = thisArg, ?loc = r)
             |> Some
         | ExprType(Number(_)) :: _ ->
             Helper.LibCall(com, "long", "sign", t, args, i.SignatureArgTypes, ?thisArg = thisArg, ?loc = r)
@@ -1359,7 +1414,9 @@ let strings (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr opt
                 |> addErrorAndReturnNull com ctx.InlinePath r
                 |> Some
         | _ -> fsFormat com ctx r t i thisArg args
-    | "get_Length", Some c, _ -> Helper.GlobalCall("len", t, [ c ], [ t ], ?loc = r) |> Some
+    | "get_Length", Some c, _ ->
+        Helper.LibCall(com, "string", "getLength", t, [ c ], i.SignatureArgTypes, ?loc = r)
+        |> Some
     | "get_Chars", Some c, _ ->
         Helper.LibCall(com, "string", "getCharAtIndex", t, args, i.SignatureArgTypes, thisArg = c, ?loc = r)
         |> Some
@@ -1518,7 +1575,10 @@ let strings (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr opt
 
 let stringModule (com: ICompiler) (ctx: Context) r t (i: CallInfo) (_: Expr option) (args: Expr list) =
     match i.CompiledName, args with
-    | "Length", [ arg ] -> Helper.GlobalCall("len", t, [ arg ], [ t ], ?loc = r) |> Some
+    | "Length", [ arg ] ->
+        // Use int32(len()) to ensure consistent return type
+        let lenExpr = Helper.GlobalCall("len", Int32.Number, [ arg ], ?loc = r)
+        Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r) |> Some
     | ("Iterate" | "IterateIndexed" | "ForAll" | "Exists"), _ ->
         // Cast the string to char[], see #1279
         let args = args |> List.replaceLast (fun e -> stringToCharArray e.Type e)
@@ -1526,12 +1586,9 @@ let stringModule (com: ICompiler) (ctx: Context) r t (i: CallInfo) (_: Expr opti
         Helper.LibCall(com, "seq", Naming.lowerFirst i.CompiledName, t, args, i.SignatureArgTypes, ?loc = r)
         |> Some
     | ("Map" | "MapIndexed" | "Collect"), _ ->
-        // Cast the string to char[], see #1279
-        let args = args |> List.replaceLast (fun e -> stringToCharArray e.Type e)
-
         let name = Naming.toSnakeCase i.CompiledName
 
-        emitExpr r t [ Helper.LibCall(com, "seq", name, Any, args, i.SignatureArgTypes) ] "''.join(list($0))"
+        Helper.LibCall(com, "string", name, t, args, i.SignatureArgTypes, ?loc = r)
         |> Some
     | "Concat", _ -> Helper.LibCall(com, "string", "join", t, args, ?loc = r) |> Some
     // Rest of StringModule methods
@@ -1551,16 +1608,79 @@ let formattableString
     match i.CompiledName, thisArg, args with
     | "Create", None, [ str; args ] -> objExpr [ "str", str; "args", args ] |> Some
     | "get_Format", Some x, _ -> getFieldWith r t x "str" |> Some
-    | "get_ArgumentCount", Some x, _ -> Helper.GlobalCall("len", t, [ getField x "args" ], [ t ], ?loc = r) |> Some
+    | "get_ArgumentCount", Some x, _ ->
+        // Use int32(len()) to ensure consistent return type
+        let lenExpr =
+            Helper.GlobalCall("len", Int32.Number, [ getField x "args" ], ?loc = r)
+
+        Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r) |> Some
     | "GetArgument", Some x, [ idx ] -> getExpr r t (getField x "args") idx |> Some
     | "GetArguments", Some x, [] -> getFieldWith r t x "args" |> Some
     | _ -> None
 
 let seqModule (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (thisArg: Expr option) (args: Expr list) =
-    // printfn "seqModule: %A" i.CompiledName
+    // Methods where the last argument is a sequence that may need string wrapping.
+    // Python strings don't implement IEnumerable_1, so they need to be wrapped when used as sequences.
+    let wrapLastArgIfString meth args =
+        match meth with
+        | "Reverse"
+        | "Head"
+        | "Tail"
+        | "Last"
+        | "Length"
+        | "TryHead"
+        | "TryLast"
+        | "ToArray"
+        | "ToList"
+        | "Cache"
+        | "IsEmpty"
+        | "ExactlyOne"
+        | "TryExactlyOne"
+        | "Indexed"
+        | "Pairwise"
+        | "Readonly"
+        | "Rev"
+        | "Sum"
+        | "SumBy"
+        | "Average"
+        | "AverageBy"
+        | "Min"
+        | "MinBy"
+        | "Max"
+        | "MaxBy"
+        | "Reduce"
+        | "ReduceBack"
+        | "ForAll"
+        | "Exists"
+        | "Iter"
+        | "IterIndexed"
+        | "Iterate"
+        | "IterateIndexed"
+        | "Item"
+        | "TryItem"
+        | "Truncate"
+        | "Take"
+        | "TakeWhile"
+        | "Skip"
+        | "SkipWhile"
+        | "Windowed"
+        | "ChunkBySize"
+        | "SplitInto"
+        | "Distinct"
+        | "DistinctBy" ->
+            match args with
+            | [] -> args
+            | _ ->
+                let lastIdx = List.length args - 1
 
-    // Wrap ResizeArray arguments with to_enumerable for type compatibility
-    let args = args |> List.map (wrapResizeArrayToEnumerable com)
+                args
+                |> List.mapi (fun i arg ->
+                    if i = lastIdx then
+                        wrapStringToEnumerable com arg
+                    else
+                        arg
+                )
+        | _ -> args
 
     match i.CompiledName, args with
     | "Cast", [ arg ] -> Some arg // Erase
@@ -1569,16 +1689,25 @@ let seqModule (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (thisArg
         |> Some
     | "Distinct" | "DistinctBy" | "Except" | "GroupBy" | "CountBy" as meth, args ->
         let meth = Naming.lowerFirst meth
+        let args = wrapLastArgIfString i.CompiledName args
         let args = injectArg com ctx r "Seq2" meth i.GenericArgs args
 
         Helper.LibCall(com, "seq2", meth, t, args, i.SignatureArgTypes, ?loc = r)
         |> Some
     | "ToArray", [ arg ] ->
+        let arg = wrapStringToEnumerable com arg
         let elementType = getElementType t
         makeArrayFrom elementType arg |> Some
 
     | meth, _ ->
         let meth = Naming.lowerFirst meth
+        let args = wrapLastArgIfString i.CompiledName args
+        // Also wrap dict to .items() for functions that iterate over key-value pairs
+        let args =
+            match args with
+            | [] -> args
+            | _ -> args |> List.replaceLast (wrapDictToItems com)
+
         let args = injectArg com ctx r "Seq" meth i.GenericArgs args
 
         Helper.LibCall(com, "seq", meth, t, args, i.SignatureArgTypes, ?thisArg = thisArg, ?loc = r)
@@ -1599,7 +1728,18 @@ let resizeArrays (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (this
     | ".ctor", _, [] -> makeResizeArray (getElementType t) [] |> Some
     | ".ctor", _, [ ExprType(Number _) ] -> makeResizeArray (getElementType t) [] |> Some
     | ".ctor", _, [ ArrayOrListLiteral(vals, _) ] -> makeResizeArray (getElementType t) vals |> Some
-    | ".ctor", _, args -> Helper.GlobalCall("list", t, args, ?loc = r) |> withTag "array" |> Some
+    // When a ResizeArray is cast to IEnumerable and passed to ResizeArray constructor,
+    // unwrap the cast since list() can handle lists directly (avoids to_enumerable wrapper)
+    | ".ctor", _, [ TypeCast(innerExpr, DeclaredType(ent, _)) ] when
+        ent.FullName = Types.ienumerableGeneric
+        && match innerExpr.Type with
+           | Array(_, ResizeArray) -> true
+           | DeclaredType(entRef, _) when entRef.FullName = Types.resizeArray -> true
+           | _ -> false
+        ->
+        Helper.GlobalCall("list", t, [ innerExpr ], ?loc = r) |> Some
+    // Use resize_array.of_seq to create a list from IEnumerable_1 or any iterable
+    | ".ctor", _, args -> Helper.LibCall(com, "resize_array", "of_seq", t, args, ?loc = r) |> Some
     | "get_Item", Some ar, [ idx ] -> getExpr r t ar idx |> Some
     | "set_Item", Some ar, [ idx; value ] -> setExpr r ar idx value |> Some
     | "Add", Some ar, [ arg ] ->
@@ -1620,7 +1760,12 @@ let resizeArrays (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (this
     | "GetEnumerator", Some ar, _ -> getEnumerator com r t ar |> Some
     | "get_Count", Some(MaybeCasted(ar)), _ ->
         match ar.Type with
-        | Array _ -> Helper.GlobalCall("len", t, [ ar ], [ t ], ?loc = r) |> Some
+        // ResizeArray is Python list - use len() wrapped in int32()
+        | Array(_, ResizeArray) ->
+            let lenExpr = Helper.GlobalCall("len", Int32.Number, [ ar ], ?loc = r)
+            Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r) |> Some
+        // MutableArray/ImmutableArray are FSharpArray (Rust) with .length property returning Int32
+        | Array _ -> getFieldWith r t ar "length" |> Some
         | _ -> Helper.LibCall(com, "util", "count", t, [ ar ], ?loc = r) |> Some
     | "Clear", Some ar, _ -> Helper.LibCall(com, "Util", "clear", t, [ ar ], ?loc = r) |> Some
     | "Find", Some ar, [ arg ] ->
@@ -1748,7 +1893,9 @@ let copyToArray (com: ICompiler) r t (i: CallInfo) args =
 let arrays (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (thisArg: Expr option) (args: Expr list) =
     // printfn "arrays: %A" i.CompiledName
     match i.CompiledName, thisArg, args with
-    | "get_Length", Some arg, _ -> Helper.GlobalCall("len", t, [ arg ], [ t ], ?loc = r) |> Some
+    | "get_Length", Some arg, _ ->
+        // All arrays in Python are FSharpArray (Rust) which has .length property returning Int32
+        getFieldWith r t arg "length" |> Some
     | "get_Item", Some arg, [ idx ] -> getExpr r t arg idx |> Some
     | "set_Item", Some arg, [ idx; value ] -> setExpr r arg idx value |> Some
     | "Copy", None, [ _source; _sourceIndex; _target; _targetIndex; _count ] -> copyToArray com r t i args
@@ -1798,22 +1945,32 @@ let arrayModule (com: ICompiler) (ctx: Context) r (t: Type) (i: CallInfo) (_: Ex
     | "ToList", args ->
         Helper.LibCall(com, "list", "of_array", t, args, i.SignatureArgTypes, ?loc = r)
         |> Some
-    | ("Length" | "Count"), [ arg ] -> Helper.GlobalCall("len", t, [ arg ], [ t ], ?loc = r) |> Some
+    | ("Length" | "Count"), [ arg ] ->
+        match arg.Type with
+        // ResizeArray is Python list - use len() wrapped in int32()
+        | Array(_, ResizeArray) ->
+            let lenExpr = Helper.GlobalCall("len", Int32.Number, [ arg ], ?loc = r)
+            Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r) |> Some
+        // MutableArray/ImmutableArray are FSharpArray (Rust) with .length property returning Int32
+        | _ -> getFieldWith r t arg "length" |> Some
     | "Item", [ idx; ar ] -> getExpr r t ar idx |> Some
     | "Get", [ ar; idx ] -> getExpr r t ar idx |> Some
     | "Set", [ ar; idx; value ] -> setExpr r ar idx value |> Some
-    | "ZeroCreate", [ count ] -> createArray count None |> Some
+    | "ZeroCreate", [ count ] ->
+        match t with
+        | Array(elemType, _) ->
+            let zeroValue = getZero com ctx elemType
+
+            Helper.LibCall(com, "array", "zero_create", t, [ count; zeroValue ], ?loc = r)
+            |> Some
+        | _ -> createArray count None |> Some
     | "Create", [ count; value ] -> createArray count (Some value) |> Some
     | "Empty", _ ->
-        let t =
-            match t with
-            | Array(t, _) -> t
-            | _ -> Any
-
-        newArray (makeIntConst 0) t |> Some
+        // Use library function to create empty FSharpArray (Rust) instead of raw Python list
+        Helper.LibCall(com, "array", "empty", t, [], ?loc = r) |> Some
     | "IsEmpty", [ ar ] ->
-        eq (Helper.GlobalCall("len", t, [ ar ], [ t ], ?loc = r)) (makeIntConst 0)
-        |> Some
+        // Use .length property (Int32) instead of len() which returns Python int
+        eq (getFieldWith r Int32.Number ar "length") (makeIntConst 0) |> Some
     | "Concat", [ ar1; ar2 ] -> makeBinOp r t ar1 ar2 BinaryPlus |> Some
     | Patterns.DicContains nativeArrayFunctions meth, _ ->
         let args, thisArg = List.splitLast args
@@ -2019,7 +2176,7 @@ let parseNum (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr op
             | Patterns.DicContains FSharp2Fable.TypeHelpers.numberTypes kind -> kind
             | x -> FableError $"Unexpected type in parse: %A{x}" |> raise
 
-        let isFloatOrDecimal, numberModule, unsigned, bitsize = getParseParams kind
+        let isFloatOrDecimal, numberModule, _unsigned, _bitsize = getParseParams kind
 
         let outValue =
             if meth = "TryParse" then
@@ -2027,15 +2184,23 @@ let parseNum (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr op
             else
                 []
 
-        let args =
-            if isFloatOrDecimal then
-                [ str ] @ outValue
-            else
-                [ str; makeIntConst style; makeBoolConst unsigned; makeIntConst bitsize ]
-                @ outValue
+        if isFloatOrDecimal then
+            let args = [ str ] @ outValue
+            // Use parse_single for Float32, regular parse for Float64/Decimal
+            let methName =
+                match kind, meth with
+                | Float32, "Parse" -> "parse_single"
+                | Float32, "TryParse" -> "try_parse" // try_parse handles both
+                | _ -> Naming.lowerFirst meth
 
-        Helper.LibCall(com, numberModule, Naming.lowerFirst meth, t, args, ?loc = r)
-        |> Some
+            Helper.LibCall(com, numberModule, methName, t, args, ?loc = r) |> Some
+        else
+            // For integer types, call the static parse method on the type
+            // This generates: int8.parse(string, style) instead of parse_int32(string, style, unsigned, bitsize)
+            let typeName = getIntTypeName kind
+            let typeExpr = Helper.LibValue(com, "core", typeName, Any)
+            let args = [ str; makeIntConst style ] @ outValue
+            Helper.InstanceCall(typeExpr, Naming.lowerFirst meth, t, args, ?loc = r) |> Some
 
     let isFloat =
         match i.SignatureArgTypes with
@@ -2325,7 +2490,6 @@ let intrinsicFunctions (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisAr
         let upper =
             match upper with
             | Value(NewOption(None, _, _), _) -> Helper.GlobalCall("len", t, [ ar ], [ t ], ?loc = r)
-            //getExpr None (Int32.Number) ar (makeStrConst "length2")
             | _ -> add upper (makeIntConst 1)
 
         Helper.InstanceCall(ar, "slice", t, [ lower; upper ], ?loc = r) |> Some
@@ -2419,7 +2583,10 @@ let dictionaries (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Exp
             |> Some
         | _ -> None
     | "get_IsReadOnly", _ -> makeBoolConst false |> Some
-    | "get_Count", _ -> Helper.GlobalCall("len", t, [ thisArg.Value ], [ t ], ?loc = r) |> Some
+    | "get_Count", Some c ->
+        // Use int32(len()) to work with both Dictionary class and plain Python dict
+        let lenExpr = Helper.GlobalCall("len", Int32.Number, [ c ], ?loc = r)
+        Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r) |> Some
     | "GetEnumerator", Some callee -> getEnumerator com r t callee |> Some
     | "ContainsValue", _ ->
         match thisArg, args with
@@ -2439,12 +2606,21 @@ let dictionaries (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Exp
     | "get_Item", _ ->
         Helper.LibCall(com, "map_util", "getItemFromDict", t, args, i.SignatureArgTypes, ?thisArg = thisArg, ?loc = r)
         |> Some
-    | ReplaceName [ "set_Item", "set"
-                    "get_Keys", "keys"
-                    "get_Values", "values"
-                    "ContainsKey", "has"
-                    "Clear", "clear" ] methName,
-      Some c -> Helper.InstanceCall(c, methName, t, args, i.SignatureArgTypes, ?loc = r) |> Some
+    | "get_Keys", Some c ->
+        // Wrap .keys() with to_enumerable since KeysView doesn't implement IEnumerable_1
+        let keysCall =
+            Helper.InstanceCall(c, "keys", t, args, i.SignatureArgTypes, ?loc = r)
+
+        Helper.LibCall(com, "util", "to_enumerable", t, [ keysCall ], ?loc = r) |> Some
+    | "get_Values", Some c ->
+        // Wrap .values() with to_enumerable since ValuesView doesn't implement IEnumerable_1
+        let valuesCall =
+            Helper.InstanceCall(c, "values", t, args, i.SignatureArgTypes, ?loc = r)
+
+        Helper.LibCall(com, "util", "to_enumerable", t, [ valuesCall ], ?loc = r)
+        |> Some
+    | ReplaceName [ "set_Item", "set"; "ContainsKey", "has"; "Clear", "clear" ] methName, Some c ->
+        Helper.InstanceCall(c, methName, t, args, i.SignatureArgTypes, ?loc = r) |> Some
     | _ -> None
 
 let hashSets (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr option) (args: Expr list) =
@@ -2462,7 +2638,9 @@ let hashSets (com: ICompiler) (ctx: Context) r t (i: CallInfo) (thisArg: Expr op
             |> makeHashSetWithComparer com r t (makeArray Any [])
             |> Some
         | _ -> None
-    | "get_Count", _, _ -> getFieldWith r t thisArg.Value "size" |> Some
+    | "get_Count", Some c, _ ->
+        Helper.LibCall(com, "mutable_set", "HashSet__get_Count", t, [ c ], ?loc = r)
+        |> Some
     | "get_IsReadOnly", _, _ -> BoolConstant false |> makeValue r |> Some
     | ReplaceName [ "Clear", "clear"; "Contains", "has"; "Remove", "delete" ] methName, Some c, args ->
         Helper.InstanceCall(c, methName, t, args, i.SignatureArgTypes, ?loc = r) |> Some
@@ -2902,7 +3080,9 @@ let random (com: ICompiler) (ctx: Context) r t (i: CallInfo) (_: Expr option) (a
 
         Helper.LibCall(com, "util", "randint", t, [ min; max ], [ min.Type; max.Type ], ?loc = r)
         |> Some
-    | "NextDouble" -> Helper.ImportedCall("random", "random", t, [], []) |> Some
+    | "NextDouble" ->
+        let ranExpr = Helper.ImportedCall("random", "random", t, [], [])
+        Helper.LibCall(com, "core", "float64", t, [ ranExpr ], ?loc = r) |> Some
     | "NextBytes" ->
         let byteArray =
             match args with
@@ -3016,7 +3196,13 @@ let regex com (ctx: Context) r t (i: CallInfo) (thisArg: Expr option) (args: Exp
         Helper.LibCall(com, "RegExp", "get_item", t, [ thisArg.Value; args.Head ], [ thisArg.Value.Type ], ?loc = r)
         |> Some
     | "get_Item" -> getExpr r t thisArg.Value args.Head |> Some
-    | "get_Count" -> Helper.GlobalCall("len", t, [ thisArg.Value ], [ t ], ?loc = r) |> Some
+    | "get_Count" ->
+        // Use int32(len()) to ensure consistent return type
+        thisArg
+        |> Option.map (fun c ->
+            let lenExpr = Helper.GlobalCall("len", Int32.Number, [ c ], ?loc = r)
+            Helper.LibCall(com, "core", "int32", t, [ lenExpr ], ?loc = r)
+        )
     | "GetEnumerator" -> getEnumerator com r t thisArg.Value |> Some
     | "IsMatch"
     | "Match"
@@ -3285,7 +3471,7 @@ let guids
             |> Some
     | ".ctor" ->
         match args with
-        | [] -> emptyGuid () |> Some
+        | [] -> emptyGuid com t |> Some
         | [ ExprType(Array _) ] ->
             Helper.LibCall(com, "guid", "array_to_guid", t, args, i.SignatureArgTypes)
             |> Some
@@ -3547,7 +3733,7 @@ let tryField com returnTyp ownerTyp fieldName =
     match ownerTyp, fieldName with
     | Number(Decimal, _), _ -> Helper.LibValue(com, "decimal", "get_" + fieldName, returnTyp) |> Some
     | String, "Empty" -> makeStrConst "" |> Some
-    | Builtin BclGuid, "Empty" -> emptyGuid () |> Some
+    | Builtin BclGuid, "Empty" -> emptyGuid com returnTyp |> Some
     | Builtin BclTimeSpan, "Zero" ->
         Helper.LibCall(com, "time_span", "create", returnTyp, [ makeIntConst 0 ])
         |> Some

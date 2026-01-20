@@ -8,11 +8,11 @@ from typing import (
 )
 
 from .task import from_result, zero
-from .util import IDisposable
+from .util import UNIT, IDisposable, Unit
 
 
 class Delayed[T](Protocol):
-    def __call__(self, __unit: None | None = None) -> Awaitable[T]: ...
+    def __call__(self, __unit: Unit = UNIT) -> Awaitable[T]: ...
 
 
 class TaskBuilder:

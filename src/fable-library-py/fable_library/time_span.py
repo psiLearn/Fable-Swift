@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from math import ceil, floor, fmod
-from typing import Any
+from typing import Any, SupportsFloat, SupportsInt
 
-from .types import FloatTypes, FSharpRef, IntegerTypes, float64, int32
+from .core import FSharpRef, float64
+from .types import FloatTypes, IntegerTypes
 from .util import pad_left_and_right_with_zeros, pad_with_zeros
 
 
@@ -15,34 +16,34 @@ class TimeSpan(int):
 
 
 def create(
-    days: float64 = float64(0),
-    hours: float64 | None = None,
-    minutes: float64 | None = None,
-    seconds: float64 | None = None,
-    milliseconds: float64 | None = None,
-    microseconds: float64 | None = None,
+    days: SupportsFloat | SupportsInt = float64(0),
+    hours: SupportsFloat | None = None,
+    minutes: SupportsFloat | None = None,
+    seconds: SupportsFloat | None = None,
+    milliseconds: SupportsFloat | None = None,
+    microseconds: SupportsFloat | None = None,
 ) -> TimeSpan:
     match (days, hours, minutes, seconds, milliseconds, microseconds):
         # ticks constructor
         case (_, None, None, None, None, None):
-            return TimeSpan(days)
+            return TimeSpan(float64(days))
         # hours, minutes, seconds constructor
         case (_, _, _, None, None, None):
             seconds = minutes
             minutes = hours
-            hours = days
+            hours = float64(days)
             days = float64(0)
         # others constructor follows the correct order of arguments
         case _:
             pass
 
     return TimeSpan(
-        float(days) * 864000000000
-        + float(hours or 0) * 36000000000
-        + float(minutes or 0) * 600000000
-        + float(seconds or 0) * 10000000
-        + float(milliseconds or 0) * 10000
-        + float(microseconds or 0) * 10
+        float64(days) * 864000000000
+        + float64(hours or 0) * 36000000000
+        + float64(minutes or 0) * 600000000
+        + float64(seconds or 0) * 10000000
+        + float64(milliseconds or 0) * 10000
+        + float64(microseconds or 0) * 10
     )
 
 
@@ -79,7 +80,10 @@ def from_microseconds(micros: IntegerTypes | FloatTypes) -> TimeSpan:
     return create(float64(0), float64(0), float64(0), float64(0), float64(0), float64(micros))
 
 
-def from_milliseconds(msecs: IntegerTypes | FloatTypes, mc: int32 | None = None) -> TimeSpan:
+def from_milliseconds(
+    msecs: SupportsFloat | SupportsInt,
+    mc: SupportsFloat | SupportsInt | None = None,
+) -> TimeSpan:
     return create(
         float64(0),
         float64(0),
@@ -90,11 +94,15 @@ def from_milliseconds(msecs: IntegerTypes | FloatTypes, mc: int32 | None = None)
     )
 
 
-def from_ticks(ticks: int32) -> TimeSpan:
+def from_ticks(ticks: SupportsInt | SupportsFloat) -> TimeSpan:
     return create(float64(ticks))
 
 
-def from_seconds(s: IntegerTypes | FloatTypes, ms: int32 | None = None, mc: int32 | None = None) -> TimeSpan:
+def from_seconds(
+    s: SupportsFloat | SupportsInt,
+    ms: SupportsFloat | SupportsInt | None = None,
+    mc: SupportsFloat | SupportsInt | None = None,
+) -> TimeSpan:
     return create(
         float64(0),
         float64(0),
@@ -106,7 +114,10 @@ def from_seconds(s: IntegerTypes | FloatTypes, ms: int32 | None = None, mc: int3
 
 
 def from_minutes(
-    m: IntegerTypes | FloatTypes, s: int32 | None = None, ms: int32 | None = None, mc: int32 | None = None
+    m: SupportsFloat | SupportsInt,
+    s: SupportsFloat | SupportsInt | None = None,
+    ms: SupportsFloat | SupportsInt | None = None,
+    mc: SupportsFloat | SupportsInt | None = None,
 ) -> TimeSpan:
     return create(
         float64(0),
@@ -119,11 +130,11 @@ def from_minutes(
 
 
 def from_hours(
-    h: IntegerTypes | FloatTypes,
-    m: int32 | None = None,
-    s: int32 | None = None,
-    ms: int32 | None = None,
-    mc: int32 | None = None,
+    h: SupportsFloat | SupportsInt,
+    m: SupportsFloat | SupportsInt | None = None,
+    s: SupportsFloat | SupportsInt | None = None,
+    ms: SupportsFloat | SupportsInt | None = None,
+    mc: SupportsFloat | SupportsInt | None = None,
 ) -> TimeSpan:
     return create(
         float64(0),
@@ -136,12 +147,12 @@ def from_hours(
 
 
 def from_days(
-    d: IntegerTypes | FloatTypes,
-    h: int32 | None = None,
-    m: int32 | None = None,
-    s: int32 | None = None,
-    ms: int32 | None = None,
-    mc: int32 | None = None,
+    d: SupportsFloat | SupportsInt,
+    h: SupportsFloat | SupportsInt | None = None,
+    m: SupportsFloat | SupportsInt | None = None,
+    s: SupportsFloat | SupportsInt | None = None,
+    ms: SupportsFloat | SupportsInt | None = None,
+    mc: SupportsFloat | SupportsInt | None = None,
 ) -> TimeSpan:
     return create(
         float64(d),

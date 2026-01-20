@@ -8,7 +8,7 @@ open Fable.Core.PyInterop
 
 [<Import("FSharpCons", ".array_")>]
 [<AllowNullLiteral>]
-type Cons<'T>() =
+type Cons<'T>(arrayType: string) =
     [<Emit("$0.allocate($1)")>]
     member _.Allocate(len: int) = nativeOnly
 
@@ -24,7 +24,7 @@ module Helpers =
 
     let allocateArrayFromCons (cons: Cons<'T>) (len: int) : 'T[] =
         if isNull cons then
-            Cons().Allocate(len)
+            Array.create len Unchecked.defaultof<'T>
         else
             cons.Allocate(len)
 
@@ -124,3 +124,6 @@ module Helpers =
 
         for i = srci to srci + cnt - 1 do
             trg.[i + diff] <- src.[i]
+
+    [<Import("to_iterator", "fable_library.util")>]
+    let toIterator (en: System.Collections.Generic.IEnumerator<'T>) : Py.Iterator<'T> = nativeOnly

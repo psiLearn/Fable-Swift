@@ -12,11 +12,14 @@ let private fableLibraryBuildDir = Path.Resolve("temp", "fable-library-py")
 
 let handle (args: string list) =
     let skipFableLibrary = args |> List.contains "--skip-fable-library"
+    let skipFableLibraryCore = args |> List.contains "--skip-fable-library-core"
     let isWatch = args |> List.contains "--watch"
     let noDotnet = args |> List.contains "--no-dotnet"
-    let runTyping = args |> List.contains "--typing"
+    let compileOnly = args |> List.contains "--compile-only"
+    let runTyping = args |> List.contains "--type-check"
+    let runFormat = args |> List.contains "--format"
 
-    BuildFableLibraryPython().Run(skipFableLibrary)
+    BuildFableLibraryPython(skipCore = skipFableLibraryCore).Run(skipFableLibrary)
 
     Directory.clean buildDir
 
@@ -37,14 +40,16 @@ let handle (args: string list) =
                 |> CmdLine.appendRaw "--noCache"
 
                 if isWatch then
+                    let ruffCmd =
+                        if runFormat then
+                            $"uv run ruff check --select I,F401 --fix {buildDir} && uv run ruff format {buildDir} && "
+                        else
+                            ""
+
                     CmdLine.empty
                     |> CmdLine.appendRaw "--watch"
                     |> CmdLine.appendRaw "--runWatch"
-                    |> CmdLine.appendRaw $"uv run pytest {buildDir} -x"
-                else
-                    CmdLine.empty
-                    |> CmdLine.appendRaw "--run"
-                    |> CmdLine.appendRaw $"uv run pytest {buildDir} -x"
+                    |> CmdLine.appendRaw $"{ruffCmd}uv run pytest {buildDir} -x"
             ]
 
     if isWatch then
@@ -62,10 +67,25 @@ let handle (args: string list) =
     else
 
         // Test against .NET
-        Command.Run("dotnet", "test -c Release", workingDirectory = sourceDir)
+        if compileOnly then
+            printfn "Skipping .NET test execution (--compile-only specified)"
+        else
+            Command.Run("dotnet", "test -c Release", workingDirectory = sourceDir)
 
         // Test against Python
         Command.Fable(fableArgs, workingDirectory = buildDir)
+
+        if runFormat then
+            // Run Ruff linter checking import sorting and fix any issues, and remove unused imports
+            Command.Run("uv", $"run ruff check --select I,F401 --fix {buildDir}")
+            // Run Ruff formatter on all generated files
+            Command.Run("uv", $"run ruff format {buildDir}")
+
+        // Run pytest
+        if compileOnly then
+            printfn "Skipping Python test execution (--compile-only specified)"
+        else
+            Command.Run("uv", $"run pytest {buildDir} -x")
 
         // Count the number of typing errors (so we can keep an eye on them)
         if runTyping then
@@ -75,7 +95,7 @@ let handle (args: string list) =
                 let struct (output, _) =
                     Command.ReadAsync(
                         "uv",
-                        "run pyright",
+                        "run pyright .",
                         workingDirectory = buildDir,
                         handleExitCode = fun _ -> true
                     )
@@ -92,4 +112,4 @@ let handle (args: string list) =
 
             printfn "Pyright summary: %s" summaryLine
         else
-            printfn "Skipping type checking (use --typing to enable)"
+            printfn "Skipping type checking (use --type-check to enable)"

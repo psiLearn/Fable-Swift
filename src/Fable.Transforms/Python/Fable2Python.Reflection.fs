@@ -15,6 +15,10 @@ open Lib
 let private libReflectionCall (com: IPythonCompiler) ctx r memberName args =
     libCall com ctx r "reflection" (memberName + "_type") args
 
+/// Wraps a Python list expression in Array(...) constructor
+let private arrayExpr (com: IPythonCompiler) ctx (items: Expression list) =
+    Expression.call (libValue com ctx "array_" "Array", [ Expression.list items ])
+
 let private transformRecordReflectionInfo com ctx r (ent: Fable.Entity) generics =
     // TODO: Refactor these three bindings to reuse in transformUnionReflectionInfo
     let fullname = ent.FullName
@@ -46,7 +50,7 @@ let private transformRecordReflectionInfo com ctx r (ent: Fable.Entity) generics
 
     let py, stmts' = pyConstructor com ctx ent
 
-    [ fullnameExpr; Expression.list generics; py; fields ]
+    [ fullnameExpr; arrayExpr com ctx generics; py; fields ]
     |> libReflectionCall com ctx None "record",
     stmts @ stmts'
 
@@ -81,7 +85,34 @@ let private transformUnionReflectionInfo com ctx r (ent: Fable.Entity) generics 
 
     let py, stmts = pyConstructor com ctx ent
 
-    [ fullnameExpr; Expression.list generics; py; cases ]
+    // Generate case constructors list for make_union
+    // Use full case class names (UnionName_CaseName) to match the generated classes,
+    // except for library types (Result, Choice) which use simple names
+    let usesSimpleNames = Util.usesSimpleCaseNames ent.FullName
+
+    // Get the entity declaration name (with module scope) for consistent naming
+    let entityDeclName = FSharp2Fable.Helpers.getEntityDeclarationName com ent.Ref
+
+    let caseConstructors =
+        ent.UnionCases
+        |> Seq.map (fun uci ->
+            let caseName =
+                match uci.CompiledName with
+                | Some cname -> cname
+                | None -> uci.Name
+
+            let caseClassName =
+                if usesSimpleNames then
+                    caseName
+                else
+                    $"%s{entityDeclName}_%s{caseName}"
+
+            com.GetIdentifierAsExpr(ctx, caseClassName)
+        )
+        |> Seq.toList
+        |> Expression.list
+
+    [ fullnameExpr; arrayExpr com ctx generics; py; cases; caseConstructors ]
     |> libReflectionCall com ctx None "union",
     stmts
 
@@ -114,7 +145,7 @@ let transformTypeInfo (com: IPythonCompiler) ctx r (genMap: Map<string, Expressi
             [
                 Expression.stringConstant fullname
                 if not (List.isEmpty generics) then
-                    Expression.list generics
+                    arrayExpr com ctx generics
             ]
 
     match t with
@@ -257,7 +288,7 @@ let transformReflectionInfo com ctx r (ent: Fable.Entity) generics =
                 yield Expression.stringConstant fullname, []
                 match generics with
                 | [] -> yield Util.undefined None, []
-                | generics -> yield Expression.list generics, []
+                | generics -> yield arrayExpr com ctx generics, []
                 match tryPyConstructor com ctx ent with
                 | Some(Expression.Name { Id = name }, stmts) ->
                     yield Expression.name (name.Name |> Naming.toPythonNaming), stmts
@@ -314,27 +345,30 @@ let transformTypeTest (com: IPythonCompiler) ctx range expr (typ: Fable.Type) : 
     | Fable.String -> pyTypeof "<class 'str'>" expr
     | Fable.Number(kind, _b) ->
         match kind, typ with
-        | _, Fable.Type.Number(UInt8, _) -> pyInstanceof (libValue com ctx "types" "uint8") expr
-        | _, Fable.Type.Number(Int8, _) -> pyInstanceof (libValue com ctx "types" "int8") expr
-        | _, Fable.Type.Number(Int16, _) -> pyInstanceof (libValue com ctx "types" "int16") expr
-        | _, Fable.Type.Number(UInt16, _) -> pyInstanceof (libValue com ctx "types" "uint16") expr
-        | _, Fable.Type.Number(Int32, _) ->
-            pyInstanceof (Expression.binOp (Expression.name "int", BitOr, libValue com ctx "types" "int32")) expr
-        | _, Fable.Type.Number(UInt32, _) -> pyInstanceof (libValue com ctx "types" "uint32") expr
-        | _, Fable.Type.Number(Int64, _) -> pyInstanceof (libValue com ctx "types" "int64") expr
-        | _, Fable.Type.Number(UInt64, _) -> pyInstanceof (libValue com ctx "types" "uint64") expr
-        | _, Fable.Type.Number(Float32, _) -> pyInstanceof (libValue com ctx "types" "float32") expr
-        | _, Fable.Type.Number(Float64, _) -> pyInstanceof (libValue com ctx "types" "float64") expr
+        | _, Fable.Type.Number(UInt8, _) -> pyInstanceof (libValue com ctx "core" "uint8") expr
+        | _, Fable.Type.Number(Int8, _) -> pyInstanceof (libValue com ctx "core" "int8") expr
+        | _, Fable.Type.Number(Int16, _) -> pyInstanceof (libValue com ctx "core" "int16") expr
+        | _, Fable.Type.Number(UInt16, _) -> pyInstanceof (libValue com ctx "core" "uint16") expr
+        | _, Fable.Type.Number(Int32, _) -> pyInstanceof (libValue com ctx "core" "int32") expr
+        | _, Fable.Type.Number(UInt32, _) -> pyInstanceof (libValue com ctx "core" "uint32") expr
+        | _, Fable.Type.Number(NativeInt, _)
+        | _, Fable.Type.Number(UNativeInt, _) -> pyInstanceof (Expression.name "int") expr
+        | _, Fable.Type.Number(Int64, _) -> pyInstanceof (libValue com ctx "core" "int64") expr
+        | _, Fable.Type.Number(UInt64, _) -> pyInstanceof (libValue com ctx "core" "uint64") expr
+        | _, Fable.Type.Number(Float32, _) -> pyInstanceof (libValue com ctx "core" "float32") expr
+        | _, Fable.Type.Number(Float64, _) -> pyInstanceof (libValue com ctx "core" "float64") expr
         | _, Fable.Type.Number(Decimal, _) -> pyTypeof "<class 'decimal.Decimal'>" expr
         | _ -> pyInstanceof (Expression.name "int") expr
 
-    | Fable.Regex -> pyInstanceof (com.GetImportExpr(ctx, "typing", "Pattern")) expr
+    | Fable.Regex -> pyInstanceof (com.GetImportExpr(ctx, "re", "Pattern")) expr
     | Fable.LambdaType _
     | Fable.DelegateType _ -> pyTypeof "<class 'function'>" expr
-    | Fable.Array _
+    | Fable.Array _ ->
+        // Use isinstance(x, Array) where Array is from fable_library.types
+        pyInstanceof (libValue com ctx "array_" "Array") expr
     | Fable.Tuple _ ->
-        let expr, stmts = com.TransformAsExpr(ctx, expr)
-        libCall com ctx None "util" "isArrayLike" [ expr ], stmts
+        // Use isinstance(x, tuple) for Python tuple type test
+        pyInstanceof (Expression.name "tuple") expr
     | Fable.List _ -> pyInstanceof (libValue com ctx "List" "FSharpList") expr
     | Fable.AnonymousRecordType _ -> warnAndEvalToFalse "anonymous records", []
     | Fable.MetaType -> pyInstanceof (libValue com ctx "Reflection" "TypeInfo") expr
@@ -358,11 +392,11 @@ let transformTypeTest (com: IPythonCompiler) ctx range expr (typ: Fable.Type) : 
             let expr, stmts = com.TransformAsExpr(ctx, expr)
             [ expr ] |> libCall com ctx None "util" "isIterable", stmts
         | Types.array ->
-            let expr, stmts = com.TransformAsExpr(ctx, expr)
-            [ expr ] |> libCall com ctx None "util" "isArrayLike", stmts
+            // Use isinstance(x, Array) where Array is from fable_library.types
+            pyInstanceof (libValue com ctx "array_" "Array") expr
         | Types.exception_ ->
             let expr, stmts = com.TransformAsExpr(ctx, expr)
-            [ expr ] |> libCall com ctx None "types" "isException", stmts
+            [ expr ] |> libCall com ctx None "exceptions" "is_exception", stmts
         | Types.datetime -> pyInstanceof (com.GetImportExpr(ctx, "datetime", "datetime")) expr
         | _ ->
             let ent = com.GetEntity(ent)

@@ -5,23 +5,39 @@ from .core import array, float32, float64, int8, int16, int32, int64, uint8, uin
 
 _T = TypeVar("_T")
 
-# Define the typed array constructors.
-Int8Array = array.FSharpCons[int8]("Int8")
-UInt8Array = array.FSharpCons[uint8]("UInt8")
-Int16Array = array.FSharpCons[int16]("Int16")
-UInt16Array = array.FSharpCons[uint16]("UInt16")
-Int32Array = array.FSharpCons[int32]("Int32")
-UInt32Array = array.FSharpCons[uint32]("UInt32")
-Int64Array = array.FSharpCons[int64]("Int64")
-UInt64Array = array.FSharpCons[uint64]("UInt64")
-Float32Array = array.FSharpCons[float32]("Float32")
-Float64Array = array.FSharpCons[float64]("Float64")
+# Typed array constructors (use these to create new typed arrays).
+Int8ArrayCons = array.FSharpCons[int8]("Int8")
+UInt8ArrayCons = array.FSharpCons[uint8]("UInt8")
+Int16ArrayCons = array.FSharpCons[int16]("Int16")
+UInt16ArrayCons = array.FSharpCons[uint16]("UInt16")
+Int32ArrayCons = array.FSharpCons[int32]("Int32")
+UInt32ArrayCons = array.FSharpCons[uint32]("UInt32")
+Int64ArrayCons = array.FSharpCons[int64]("Int64")
+UInt64ArrayCons = array.FSharpCons[uint64]("UInt64")
+Float32ArrayCons = array.FSharpCons[float32]("Float32")
+Float64ArrayCons = array.FSharpCons[float64]("Float64")
+BoolArrayCons = array.FSharpCons[bool]("Bool")
+
+# Typed array classes (use these for isinstance checks and type annotations).
+Int8Array = array.Int8Array
+UInt8Array = array.UInt8Array
+Int16Array = array.Int16Array
+UInt16Array = array.UInt16Array
+Int32Array = array.Int32Array
+UInt32Array = array.UInt32Array
+Int64Array = array.Int64Array
+UInt64Array = array.UInt64Array
+Float32Array = array.Float32Array
+Float64Array = array.Float64Array
+BoolArray = array.BoolArray
+GenericArray = array.GenericArray
 
 # Import loose functions directly from array module
 append = array.append
 chunk_by_size = array.chunk_by_size
 compare_with = array.compare_with
 create = array.create
+zero_create = array.zero_create
 collect = array.collect
 empty = array.empty
 equals_with = array.equals_with
@@ -127,15 +143,29 @@ FSharpCons = array.FSharpCons
 
 __all__ = [
     "Array",
+    "BoolArray",
+    "BoolArrayCons",
+    "Float32Array",
+    "Float32ArrayCons",
     "Float64Array",
+    "Float64ArrayCons",
+    "GenericArray",
     "Int8Array",
+    "Int8ArrayCons",
     "Int16Array",
+    "Int16ArrayCons",
     "Int32Array",
+    "Int32ArrayCons",
     "Int64Array",
+    "Int64ArrayCons",
     "UInt8Array",
+    "UInt8ArrayCons",
     "UInt16Array",
+    "UInt16ArrayCons",
     "UInt32Array",
+    "UInt32ArrayCons",
     "UInt64Array",
+    "UInt64ArrayCons",
     "add_in_place",
     "add_range_in_place",
     "append",
@@ -212,8 +242,6 @@ __all__ = [
     "skip_while",
     "sort",
     "sort_by",
-    "sort_by",
-    "sort_in_place",
     "sort_in_place",
     "sort_in_place_by",
     "sort_in_place_with",
@@ -236,5 +264,6 @@ __all__ = [
     "unzip",
     "update_at",
     "windowed",
+    "zero_create",
     "zip",
 ]

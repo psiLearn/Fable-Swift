@@ -1,9 +1,9 @@
 from typing import Any, Literal, SupportsFloat, SupportsInt, overload
 
+from .core import float64, int32, int64, uint64
 from .core._core import get_range_64 as get_range
 from .core._core import parse_int64 as parse
 from .core._core import try_parse_int64 as try_parse
-from .types import float64, int32, int64, uint64
 
 
 def compare(x: int64, y: int64) -> int64:
@@ -225,14 +225,16 @@ def from_int(value: int64, unsigned: bool = False) -> int64:
     return value
 
 
-def from_value(value: Any, unsigned: bool = False) -> int64:
-    value = int(value)
-    if unsigned and value < 0:
-        return value + 0x10000000000000000
-    elif not unsigned and value > 9223372036854775807:
-        return value - 0x10000000000000000
+@overload
+def from_value(value: Any, unsigned: Literal[True]) -> uint64: ...
 
-    return value
+
+@overload
+def from_value(value: Any, unsigned: Literal[False] = ...) -> int64: ...
+
+
+def from_value(value: Any, unsigned: bool = False) -> int64 | uint64:
+    return uint64(value) if unsigned else int64(value)
 
 
 @overload
@@ -244,10 +246,7 @@ def from_number(value: SupportsInt, unsigned: Literal[False]) -> int64: ...
 
 
 def from_number(value: SupportsInt, unsigned: bool) -> int64 | uint64:
-    if unsigned:
-        return uint64(value)
-    else:
-        return int64(value)
+    return uint64(value) if unsigned else int64(value)
 
 
 def to_number(value: SupportsFloat | SupportsInt) -> float64:
@@ -255,14 +254,14 @@ def to_number(value: SupportsFloat | SupportsInt) -> float64:
 
 
 @overload
-def from_integer(value: int, unsigned: Literal[True], kind: int) -> uint64: ...
+def from_integer(value: SupportsInt, unsigned: Literal[True], kind: int) -> uint64: ...
 
 
 @overload
-def from_integer(value: int, unsigned: Literal[False], kind: int) -> int64: ...
+def from_integer(value: SupportsInt, unsigned: Literal[False], kind: int) -> int64: ...
 
 
-def from_integer(value: int, unsigned: bool | None = None, kind: int | None = None) -> int64 | uint64:
+def from_integer(value: SupportsInt, unsigned: bool | None = None, kind: int | None = None) -> int64 | uint64:
     if unsigned:
         return uint64(value)
     else:

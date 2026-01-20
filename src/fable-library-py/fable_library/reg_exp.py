@@ -4,7 +4,10 @@ import re
 from collections.abc import Callable, Iterator
 from re import Match, Pattern
 
+from .array_ import Array
+from .protocols import IEnumerator
 from .types import IntegerTypes
+from .util import UNIT, Enumerator, Unit
 
 
 MatchEvaluator = Callable[[Match[str]], str]
@@ -29,6 +32,28 @@ class GroupCollection:
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.groups)
+
+    def GetEnumerator(self, __unit: Unit = UNIT) -> IEnumerator[str]:
+        return Enumerator(iter(self.groups))
+
+
+class MatchCollection:
+    """A collection of Match objects that supports both iteration and len()."""
+
+    def __init__(self, matches: list[Match[str]]) -> None:
+        self._matches = matches
+
+    def __len__(self) -> int:
+        return len(self._matches)
+
+    def __getitem__(self, index: int) -> Match[str]:
+        return self._matches[index]
+
+    def __iter__(self) -> Iterator[Match[str]]:
+        return iter(self._matches)
+
+    def GetEnumerator(self, __unit: Unit = UNIT) -> IEnumerator[Match[str]]:
+        return Enumerator(iter(self._matches))
 
 
 def _options_to_flags(options: int) -> int:
@@ -62,15 +87,18 @@ def match(reg: Pattern[str], input: str, start_at: int = 0) -> Match[str] | None
     return reg.search(input, pos=start_at)
 
 
-def matches(reg: Pattern[str], input: str, start_at: int = 0) -> list[Match[str]]:
-    return list(reg.finditer(input, pos=start_at))
+def matches(reg: Pattern[str], input: str, start_at: int = 0) -> MatchCollection:
+    return MatchCollection(list(reg.finditer(input, pos=start_at)))
 
 
 def is_match(reg: Pattern[str], input: str, start_at: int = 0) -> bool:
     return reg.search(input, pos=start_at) is not None
 
 
-def groups(m: Match[str]) -> GroupCollection:
+def groups(m: Match[str] | None) -> GroupCollection:
+    if m is None:
+        return GroupCollection(named_groups={}, groups=[])
+
     named_groups: dict[str, str] = m.groupdict()
 
     # .NET adds the whole capture as group 0
@@ -112,12 +140,13 @@ def split(
     input: str,
     limit: int | None = None,
     offset: int = 0,
-) -> list[str]:
+) -> Array[str]:
     if isinstance(reg, str):
-        return re.split(input, reg, maxsplit=limit or 0)
-
-    input = input[offset:]
-    return reg.split(input, maxsplit=limit or 0)[:limit]
+        result = re.split(input, reg, maxsplit=limit or 0)
+    else:
+        input = input[offset:]
+        result = reg.split(input, maxsplit=limit or 0)[:limit]
+    return Array[str](result)
 
 
 def get_item(groups: GroupCollection, index: str | int) -> str | None:
@@ -125,6 +154,7 @@ def get_item(groups: GroupCollection, index: str | int) -> str | None:
 
 
 __all__ = [
+    "MatchCollection",
     "create",
     "escape",
     "get_item",

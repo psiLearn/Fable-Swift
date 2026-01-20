@@ -147,10 +147,6 @@ let knownCliArgs () =
             ""
             "Support for TypeScript, Python, Rust, Php, Dart and Swift is experimental."
         ]
-        [ "--legacyCracker" ],
-        [
-            "Use this if you have issues with the new MSBuild Cracker released in Fable 5"
-        ]
 
         // Hidden args
         [ "--precompiledLib" ], []
@@ -288,7 +284,6 @@ type Runner =
                 args.Value("--precompiledLib") |> Option.map normalizeAbsolutePath
 
             let fableLib = args.Value "--fableLib" |> Option.map Path.normalizePath
-            let useLegacyCracker = args.FlagOr("--legacyCracker", false)
 
             do!
                 match watch, outDir, fableLib with
@@ -402,7 +397,7 @@ type Runner =
                     None
 
             let startCompilation () =
-                State.Create(cliArgs, ?watchDelay = watchDelay, useMSBuildForCracking = not useLegacyCracker)
+                State.Create(cliArgs, ?watchDelay = watchDelay)
                 |> startCompilationAsync
                 |> Async.RunSynchronously
 

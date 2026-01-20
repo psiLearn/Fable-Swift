@@ -137,6 +137,8 @@ jobs:
         platform: [ubuntu-latest, windows-latest]
         python-version: [3.12, 3.13, 3.14]
     runs-on: ${{ matrix.platform }}
+    env:
+      UV_LINK_MODE: copy
 
     steps:
       - uses: actions/checkout@v5
@@ -145,9 +147,6 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
-
-      - name: Setup dotnet tools
-        run: dotnet tool restore
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
