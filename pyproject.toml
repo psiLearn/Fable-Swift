@@ -9,7 +9,9 @@ authors = [
 requires-python = ">= 3.12, < 4.0"
 readme = "README.md"
 license = "MIT"
-dependencies = ["python-dateutil>=2.9.0,<3"]
+dependencies = [
+    "python-dateutil>=2.9.0,<3",
+]
 
 [project.urls]
 Homepage = "https://fable.io"
@@ -22,7 +24,8 @@ dev = [
     "dunamai>=1.23.1,<2",
     "pydantic>=2.11.7",
     "attrs>=25.3.0",
-    "pyright>=1.1.403",
+    "pyright>=1.1.408",
+    "ty>=0.0.7",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -38,25 +41,8 @@ include = ["./temp/fable-library-py/fable_library"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.pyright]
-reportMissingTypeStubs = false
-reportMissingImports = false
-reportUnnecessaryTypeIgnoreComment = true
-reportUnusedImport = true
-reportUnusedVariable = false
-reportUnnecessaryIsInstance = true
-reportUnnecessaryComparison = true
-reportUnnecessaryCast = true
-reportPrivateUsage = false # Getters/setters reference private members from outside the class
-reportImportCycles = true
-reportDuplicateImport = true
-reportConstantRedefinition = true
-reportOverlappingOverload = true
-reportInconsistentConstructor = true
-reportImplicitStringConcatenation = true
-
-pythonVersion = "3.12"
-typeCheckingMode = "standard"
+[tool.uv]
+package = false # This is a project, not a package
 
 [tool.ruff]
 line-length = 120

@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+* [Python] Changed DU representation to use separate classes for each case (by @dbrattli)
+* [Python] Fable will no longer auto-generate `__str__` or `__hash__` for custom types. Use the `Py.Stringable` and `Py.Hashable` marker interfaces to generate these methods (by @dbrattli)
+
+### Added
+
+* [Python] Added ABC base classes for F# types and Py marker interfaces for Python interop (by @dbrattli)
+* [Python] Add tuple pattern matching with guards and improve match statement generation (by @dbrattli)
+* [Python] Add Python 3.10+ match statement support for pattern matching (by @dbrattli)
+
 ### Fixed
 
+* [Python] Fix curry/uncurry to handle arbitrary number of arguments (by @dbrattli)
+* [Python] Fix type annotations for protocols, Option casting, and abstract classes (by @dbrattli)
+* [Python] Fix type annotations for curried functions and numeric types (by @dbrattli)
+* [Python] Fix type annotations for inref, IList, DateKind, and regex collections (by @dbrattli)
+* [Python] Fix type annotations for protocols, ABCs, Atom, and Set module (by @dbrattli)
+* [Python] Fix type annotations for async functions, date operations, and None handling (by @dbrattli)
+* [Python] Fix type annotations for tuple indexing, generic defaults, and reflection (by @dbrattli)
+
+## 5.0.0-alpha.21 - 2025-12-26
+
+### Fixed
+
+* [Python] Use Fable AST for type parameter extraction instead of Python AST heuristics (by @dbrattli)
+* [Python] Fix library type stubs for parse_int32/64 and from_integer (by @dbrattli)
+* [Python] Fix missing type parameters on generic methods (by @dbrattli)
 * [JS/TS] Fix #4305 DateTimeOffset.Now returns wrong time (by @ncave)
 
 ## 5.0.0-alpha.20 - 2025-12-15

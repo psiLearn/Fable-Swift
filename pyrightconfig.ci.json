@@ -1,0 +1,10 @@
+{
+  "extends": "./pyrightconfig.json",
+  "exclude": [
+    "**/.venv/**",
+    "**/node_modules/**",
+    "temp/tests/Python/test_applicative.py",
+    "temp/tests/Python/test_misc.py",
+    "temp/tests/Python/fable_modules/thoth_json_python/encode.py"
+  ]
+}

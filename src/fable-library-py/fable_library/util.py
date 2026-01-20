@@ -5,7 +5,6 @@ import functools
 import platform
 import random
 import re
-import weakref
 from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import (
     Callable,
@@ -21,21 +20,150 @@ from types import TracebackType
 from typing import (
     Any,
     ClassVar,
+    Final,
     Literal,
     Protocol,
+    Self,
     TypeGuard,
     cast,
+    overload,
 )
 from urllib.parse import quote, unquote
 
 from .array_ import Array
-from .core import float64, int32
+from .bases import (
+    ComparableBase,
+    DisposableBase,
+    EnumerableBase,
+    EnumeratorBase,
+    EquatableBase,
+    HashableBase,
+    SizedBase,
+    StringableBase,
+)
+from .core import float32, float64, int32
+
+# Re-export protocols for backward compatibility
+from .exceptions import ObjectDisposedException
+from .protocols import (
+    HashCode,
+    IDisposable,
+    IEnumerable_1,
+    IEnumerator,
+    SupportsLessThan,
+)
+from .types import UNIT, Unit
 
 
-class SupportsLessThan(Protocol):
-    @abstractmethod
-    def __lt__(self, __other: Any) -> bool:
-        raise NotImplementedError
+class nullable:
+    """Returns a tuple of None values with the specified types.
+
+    Used for pattern matching variable initialization where variables need
+    to be typed but initialized to None. This is a type-safe alternative to
+    `cast(T, None)` for multiple variables.
+
+    Example:
+        (pattern_matching_result, m, n) = nullable[int, int, int]()
+
+    The type checker sees the tuple as `tuple[int, int, int]` even though
+    all values are None at runtime.
+    """
+
+    _params: tuple[type, ...] | None = None
+
+    def __class_getitem__(cls, params: Any) -> type[nullable]:
+        # Create a new class that remembers the params
+        class _Nullable(nullable):
+            _params = params if isinstance(params, tuple) else (params,)
+
+        return _Nullable
+
+    def __new__(cls) -> Any:
+        if cls._params is None:
+            raise TypeError("Must specify type parameters: nullable[T1, T2, ...]()")
+        return tuple(None for _ in cls._params)
+
+
+# =============================================================================
+# Disposable Classes
+# =============================================================================
+# These classes provide disposable/context manager implementations.
+
+
+class AnonymousDisposable(DisposableBase):
+    """A disposable that calls a provided action when disposed."""
+
+    __slots__ = "_action", "_is_disposed", "_lock"
+
+    def __init__(self, action: Callable[[], None]) -> None:
+        self._is_disposed = False
+        self._action = action
+        self._lock = RLock()
+
+    def Dispose(self) -> None:
+        """Performs the task of cleaning up resources."""
+        dispose = False
+        with self._lock:
+            if not self._is_disposed:
+                dispose = True
+                self._is_disposed = True
+
+        if dispose:
+            self._action()
+
+    def __enter__(self) -> Self:
+        if self._is_disposed:
+            raise ObjectDisposedException()
+        return self
+
+
+class Disposable[T: IDisposable](DisposableBase):
+    """Context manager wrapper for IDisposable objects.
+
+    Wraps any object with a Dispose() method to provide Python context manager
+    support. The __enter__ method returns the wrapped value (not self), so the
+    `as` target receives the original IDisposable object.
+
+    Example:
+        with Disposable(some_enumerator) as e:
+            # e is the enumerator, not the wrapper
+            while e.MoveNext():
+                print(e.Current)
+        # e.Dispose() is called automatically
+
+    Also provides a static factory method for creating disposables from actions,
+    following the System.Reactive Disposable pattern.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: T) -> None:
+        self._value = value
+
+    def __enter__(self) -> T:
+        """Enter context management, returning the wrapped value."""
+        return self._value
+
+    def __exit__(
+        self,
+        exctype: type[BaseException] | None,
+        excinst: BaseException | None,
+        exctb: TracebackType | None,
+    ) -> Literal[False]:
+        """Exit context management, calling Dispose on the wrapped value."""
+        self.Dispose()
+        return False
+
+    def Dispose(self) -> None:
+        """Dispose the wrapped value."""
+        dispose = getattr(self._value, "Dispose", None)
+        if dispose is not None:
+            dispose()
+
+    @staticmethod
+    def create(action: Callable[[], None]) -> AnonymousDisposable:
+        """Create a disposable from an action. Will call action when disposed."""
+        return AnonymousDisposable(action)
 
 
 def returns[T, **P](targettype: Callable[..., T]) -> Callable[[Callable[P, Any]], Callable[P, T]]:
@@ -50,177 +178,10 @@ def returns[T, **P](targettype: Callable[..., T]) -> Callable[[Callable[P, Any]]
     return decorator
 
 
-class ObjectDisposedException(Exception):
-    def __init__(self):
-        super().__init__("Cannot access a disposed object")
-
-
-class IDisposable(ABC):
-    """IDisposable interface.
-
-    Note: IDisposable is currently not a protocol since it also
-    implements resource management and thus cannot use static subtyping
-    and needs to be inherited from.
-    """
-
-    __slots__ = ()
-
-    @abstractmethod
-    def Dispose(self) -> None: ...
-
-    def __enter__(self):
-        """Enter context management."""
-        return self
-
-    def __exit__(
-        self,
-        exctype: type[BaseException] | None,
-        excinst: BaseException | None,
-        exctb: TracebackType | None,
-    ) -> Literal[False]:
-        """Exit context management."""
-
-        self.Dispose()
-        return False
-
-    @staticmethod
-    def create(action: Callable[[], None]):
-        """Create disposable from action. Will call action when
-        disposed."""
-        return AnonymousDisposable(action)
-
-
-# Disposable is now a type parameter in function definitions
-
-
-class AnonymousDisposable(IDisposable):
-    __slots__ = "_action", "_is_disposed", "_lock"
-
-    def __init__(self, action: Callable[[], None]):
-        self._is_disposed = False
-        self._action = action
-        self._lock = RLock()
-
-    def Dispose(self) -> None:
-        """Performs the task of cleaning up resources."""
-
-        dispose = False
-        with self._lock:
-            if not self._is_disposed:
-                dispose = True
-                self._is_disposed = True
-
-        if dispose:
-            self._action()
-
-    def __enter__(self):
-        if self._is_disposed:
-            raise ObjectDisposedException()
-        return self
-
-
-class IEquatable(Protocol):
-    def __eq__(self, other: Any) -> bool: ...
-
-    def __hash__(self) -> int: ...
-
-
-class IComparable(IEquatable, Protocol):
-    @abstractmethod
-    def __cmp__(self, __other: Any) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def __lt__(self, other: Any) -> bool:
-        raise NotImplementedError
-
-
-class IComparable_1[T_in](IEquatable, Protocol):
-    @abstractmethod
-    def __cmp__(self, __other: T_in) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def __lt__(self, other: Any) -> bool:
-        raise NotImplementedError
-
-
-class IComparer(Protocol):
-    """Defines a method that a type implements to compare two objects.
-
-    https://docs.microsoft.com/en-us/dotnet/api/system.collections.generic.icomparer-1
-    """
-
-    @abstractmethod
-    def Compare[T_in](self, x: Any = None, y: Any = None) -> int32:
-        raise NotImplementedError
-
-
-class IComparer_1[T_in](Protocol):
-    """Defines a method that a type implements to compare two objects.
-
-    https://docs.microsoft.com/en-us/dotnet/api/system.collections.generic.icomparer-1
-    """
-
-    @abstractmethod
-    def Compare(self, x: T_in, y: T_in, /) -> int32:
-        raise NotImplementedError
-
-
-class IEqualityComparer(Protocol):
-    @abstractmethod
-    def Equals(self, x: Any = None, y: Any = None, /) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def GetHashCode(self, /, x: Any = None) -> int32:
-        raise NotImplementedError
-
-
-class IEqualityComparer_1[T_in](Protocol):
-    @abstractmethod
-    def Equals(self, /, x: T_in, y: T_in) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def GetHashCode(self) -> int32:
-        raise NotImplementedError
-
-
-class IStructuralEquatable(Protocol):
-    @abstractmethod
-    def Equals(self, other: Any, comparer: IEqualityComparer) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def __hash__(self) -> int32:
-        raise NotImplementedError
-
-
-class IStructuralComparable(Protocol):
-    @abstractmethod
-    def __cmp__(self, other: Any, comparer: IComparer) -> int32:
-        raise NotImplementedError
-
-
-class ISet[T](Protocol):
-    """Protocol for set-like objects that support add/has operations."""
-
-    @abstractmethod
-    def add(self, value: T) -> Any:
-        """Add a value to the set."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def __contains__(self, value: T) -> bool:
-        """Check if value is in the set."""
-        raise NotImplementedError
-
-
-class DateKind(IntEnum):
-    Unspecified = 0
-    UTC = 1
-    Local = 2
+class DateKind:
+    Unspecified: Final[int32] = int32(0)
+    UTC: Final[int32] = int32(1)
+    Local: Final[int32] = int32(2)
 
 
 def equals(a: Any, b: Any) -> bool:
@@ -234,21 +195,24 @@ def equals(a: Any, b: Any) -> bool:
             return False
         case (_, None):
             return False
-        case (a, b) if is_array_like(a):
+        case (a, b) if isinstance(a, Array):
             return equal_arrays(a, b)
+        case (a, b) if hasattr(a, "Equals") and callable(a.Equals):
+            # Call Equals method for classes with override Equals (F# style)
+            return bool(a.Equals(b))
         case _:
             return a == b
 
 
 def is_comparable(x: Any) -> bool:
-    return hasattr(x, "__cmp__") and callable(x.__cmp__)
+    return hasattr(x, "CompareTo") and callable(x.CompareTo)
 
 
 def is_equatable(x: Any) -> bool:
-    return hasattr(x, "__eq__") and callable(x.__eq__)
+    return (hasattr(x, "Equals") and callable(x.Equals)) or (hasattr(x, "__eq__") and callable(x.__eq__))
 
 
-def is_iterable(x: Any) -> bool:
+def is_iterable(x: object) -> bool:
     return isinstance(x, Iterable)
 
 
@@ -280,7 +244,7 @@ def compare_dicts(x: dict[str, Any], y: dict[str, Any]) -> int:
 
 
 @returns(int32)
-def compare_arrays(xs: list[Any] | None, ys: list[Any] | None) -> int:
+def compare_arrays(xs: Sequence[Any] | None, ys: Sequence[Any] | None) -> int:
     if xs is None:
         return 0 if ys is None else 1
 
@@ -309,7 +273,7 @@ def compare(a: Any, b: Any) -> int:
         case (a, None):
             return 1 if a else 0
         case (a, b) if is_comparable(a):
-            return a.__cmp__(b)
+            return a.CompareTo(b)
         case (a, b) if isinstance(a, dict):
             return compare_dicts(cast(dict[str, Any], a), b)
         case (a, b) if isinstance(a, list):
@@ -423,16 +387,24 @@ def pad_left_and_right_with_zeros(i: int, length_left: int, length_right: int) -
 
 
 class Atom[T](Protocol):
+    @overload
+    def __call__(self) -> T: ...
+    @overload
+    def __call__(self, value: T, /) -> None: ...
     def __call__(self, *value: T) -> T | None: ...
 
 
 def create_atom[T](value: T) -> Atom[T]:
     atom = value
 
+    @overload
+    def wrapper() -> T: ...
+    @overload
+    def wrapper(value: T, /) -> None: ...
     def wrapper(*value: T) -> T | None:
         nonlocal atom
 
-        if len(value) == 0:
+        if not value:
             return atom
 
         atom = value[0]
@@ -465,12 +437,13 @@ def int_to_string(i: int, radix: int = 10, bitsize: int | None = None) -> str:
     return str(i)
 
 
-def count(col: Iterable[Any]) -> int32:
-    if isinstance(col, Sized):
-        return int32(len(col))
+def count(it: IEnumerable_1[Any] | Iterable[Any]) -> int32:
+    it = to_iterable(it)
+    if isinstance(it, Sized):
+        return int32(len(it))
 
     count = int32.ZERO
-    for _ in col:
+    for _ in it:
         count += 1
 
     return count
@@ -481,70 +454,9 @@ def clear(col: dict[Any, Any] | list[Any] | None) -> None:
         col.clear()
 
 
-class IEnumerator[T](Iterator[T], IDisposable):
-    __slots__ = ()
+class Enumerator[T](EnumeratorBase[T], DisposableBase, IEnumerator[T]):
+    """Concrete enumerator that wraps a Python iterator."""
 
-    def Current(self) -> T:
-        return self.System_Collections_Generic_IEnumerator_1_get_Current()
-
-    def MoveNext(self) -> bool:
-        return self.System_Collections_IEnumerator_MoveNext()
-
-    def Reset(self) -> None:
-        return self.System_Collections_IEnumerator_Reset()
-
-    @abstractmethod
-    def System_Collections_Generic_IEnumerator_1_get_Current(self) -> T: ...
-
-    def System_Collections_IEnumerator_get_Current(self) -> Any:
-        return self.System_Collections_Generic_IEnumerator_1_get_Current()
-
-    @abstractmethod
-    def System_Collections_IEnumerator_MoveNext(self) -> bool: ...
-
-    @abstractmethod
-    def System_Collections_IEnumerator_Reset(self) -> None: ...
-
-    def __iter__(self) -> Iterator[T]:
-        return self
-
-    def __next__(self) -> T:
-        if not self.MoveNext():
-            raise StopIteration
-        return self.Current()
-
-
-class IEnumerable(Iterable[Any], Protocol):
-    __slots__ = ()
-
-    @abstractmethod
-    def GetEnumerator(self) -> IEnumerator[Any]: ...
-
-    def __iter__(self) -> Iterator[Any]:
-        return self.GetEnumerator()
-
-
-class IEnumerable_1[T](Iterable[T], Protocol):
-    __slots__ = ()
-
-    @abstractmethod
-    def GetEnumerator(self) -> IEnumerator[T]: ...
-
-    def __iter__(self) -> Iterator[T]:
-        return self.GetEnumerator()
-
-
-class ICollection[T](IEnumerable_1[T], Protocol): ...
-
-
-class IDictionary[Key, Value](ICollection[tuple[Key, Value]], Protocol):
-    @abstractmethod
-    def keys(self) -> IEnumerable_1[Key]: ...
-
-    def values(self) -> IEnumerable_1[Value]: ...
-
-
-class Enumerator[T](IEnumerator[T]):
     __slots__ = "current", "iter"
 
     def __init__(self, iter: Iterator[T]) -> None:
@@ -552,6 +464,10 @@ class Enumerator[T](IEnumerator[T]):
         self.current: T
 
     def System_Collections_Generic_IEnumerator_1_get_Current(self) -> T:
+        return self.current
+
+    def System_Collections_IEnumerator_get_Current(self) -> Any:
+        """Non-generic IEnumerator.Current implementation."""
         return self.current
 
     def System_Collections_IEnumerator_MoveNext(self) -> bool:
@@ -575,13 +491,15 @@ class Enumerator[T](IEnumerator[T]):
         return self
 
 
-class Enumerable[T](IEnumerable_1[T]):
+class Enumerable[T](EnumerableBase[T]):
+    """Concrete enumerable that wraps a Python iterable."""
+
     __slots__ = "xs"
 
     def __init__(self, xs: Iterable[T]) -> None:
         self.xs = xs
 
-    def GetEnumerator(self) -> IEnumerator[T]:
+    def GetEnumerator(self, __unit: Unit = UNIT) -> IEnumerator[T]:
         return Enumerator(iter(self.xs))
 
     def __iter__(self) -> Iterator[T]:
@@ -592,1943 +510,26 @@ def to_enumerable[T](e: Iterable[T]) -> IEnumerable_1[T]:
     return Enumerable(e)
 
 
-def get_enumerator(o: Iterable[Any]) -> Enumerator[Any]:
+def get_enumerator(o: IEnumerable_1[Any] | Iterable[Any]) -> Enumerator:
     attr = getattr(o, "GetEnumerator", None)
     if attr:
         return attr()
-    elif isinstance(o, dict):
+
+    if isinstance(o, dict):
         # Dictionaries should produce tuples
         return Enumerator(iter(cast(Any, o.items())))
-    else:
-        return Enumerator(iter(o))
 
+    return Enumerator(iter(cast(Any, o)))
 
-_curried = weakref.WeakKeyDictionary[Any, Any]()
 
+def is_array_like(x: Any) -> TypeGuard[Array]:
+    # Match FSharpArray (Rust) which has .length property
+    # Also match tuples for F# tuple pattern matching
+    # Python lists should fall through to the iterator path (no .length)
+    return isinstance(x, Array | tuple)
 
-def uncurry2[T1, T2, TResult](f: Callable[[T1], Callable[[T2], TResult]]) -> Callable[[T1, T2], TResult]:
-    def f2(a1: T1, a2: T2) -> TResult:
-        return f(a1)(a2)
 
-    _curried[f2] = f
-    return f2
-
-
-def curry2[T1, T2, TResult](f: Callable[[T1, T2], TResult]) -> Callable[[T1], Callable[[T2], TResult]]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: f(a1, a2)
-    else:
-        return f2
-
-
-def uncurry3[T1, T2, T3, TResult](
-    f: Callable[[T1], Callable[[T2], Callable[[T3], TResult]]],
-) -> Callable[[T1, T2, T3], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3) -> TResult:
-        return f(a1)(a2)(a3)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry3[T1, T2, T3, TResult](
-    f: Callable[[T1, T2, T3], TResult],
-) -> Callable[[T1], Callable[[T2], Callable[[T3], TResult]]]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: f(a1, a2, a3)
-    else:
-        return f2
-
-
-def uncurry4[T1, T2, T3, T4, TResult](
-    f: Callable[[T1], Callable[[T2], Callable[[T3], Callable[[T4], TResult]]]],
-) -> Callable[[T1, T2, T3, T4], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4) -> TResult:
-        return f(a1)(a2)(a3)(a4)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry4[T1, T2, T3, T4, TResult](
-    f: Callable[[T1, T2, T3, T4], TResult],
-) -> Callable[[T1], Callable[[T2], Callable[[T3], Callable[[T4], TResult]]]]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: f(a1, a2, a3, a4)
-    else:
-        return f2
-
-
-def uncurry5[T1, T2, T3, T4, T5, TResult](
-    f: Callable[
-        [T1],
-        Callable[[T2], Callable[[T3], Callable[[T4], Callable[[T5], TResult]]]],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4, a5: T5) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry5[T1, T2, T3, T4, T5, TResult](
-    f: Callable[[T1, T2, T3, T4, T5], TResult],
-) -> Callable[[T1], Callable[[T2], Callable[[T3], Callable[[T4], Callable[[T5], TResult]]]]]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: f(a1, a2, a3, a4, a5)
-    else:
-        return f2
-
-
-def uncurry6[T1, T2, T3, T4, T5, T6, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[[T3], Callable[[T4], Callable[[T5], Callable[[T6], TResult]]]],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4, a5: T5, a6: T6) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry6[T1, T2, T3, T4, T5, T6, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[[T3], Callable[[T4], Callable[[T5], Callable[[T6], TResult]]]],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: f(a1, a2, a3, a4, a5, a6)
-    else:
-        return f2
-
-
-def uncurry7[T1, T2, T3, T4, T5, T6, T7, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[[T4], Callable[[T5], Callable[[T6], Callable[[T7], TResult]]]],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4, a5: T5, a6: T6, a7: T7) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry7[T1, T2, T3, T4, T5, T6, T7, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[[T4], Callable[[T5], Callable[[T6], Callable[[T7], TResult]]]],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: f(
-            a1, a2, a3, a4, a5, a6, a7
-        )
-    else:
-        return f2
-
-
-def uncurry8[T1, T2, T3, T4, T5, T6, T7, T8, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[[T6], Callable[[T7], Callable[[T8], TResult]]],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4, a5: T5, a6: T6, a7: T7, a8: T8) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry8[T1, T2, T3, T4, T5, T6, T7, T8, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[[T5], Callable[[T6], Callable[[T7], Callable[[T8], TResult]]]],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: f(
-            a1, a2, a3, a4, a5, a6, a7, a8
-        )
-    else:
-        return f2
-
-
-def uncurry9[T1, T2, T3, T4, T5, T6, T7, T8, T9, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[[T7], Callable[[T8], Callable[[T9], TResult]]],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9], TResult]:
-    def f2(a1: T1, a2: T2, a3: T3, a4: T4, a5: T5, a6: T6, a7: T7, a8: T8, a9: T9) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry9[T1, T2, T3, T4, T5, T6, T7, T8, T9, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[[T7], Callable[[T8], Callable[[T9], TResult]]],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: f(
-            a1, a2, a3, a4, a5, a6, a7, a8, a9
-        )
-    else:
-        return f2
-
-
-def uncurry10[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[[T8], Callable[[T9], Callable[[T10], TResult]]],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], TResult]:
-    def f2(
-        a1: T1,
-        a2: T2,
-        a3: T3,
-        a4: T4,
-        a5: T5,
-        a6: T6,
-        a7: T7,
-        a8: T8,
-        a9: T9,
-        a10: T10,
-    ) -> TResult:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry10[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[[T8], Callable[[T9], Callable[[T10], TResult]]],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry11[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[[T10], Callable[[T11], TResult]],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], TResult]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry11[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[[T9], Callable[[T10], Callable[[T11], TResult]]],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry12[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[[T11], Callable[[T12], TResult]],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], TResult]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry12[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[[T11], Callable[[T12], TResult]],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry13[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[[T12], Callable[[T13], TResult]],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], TResult]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry13[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, TResult](
-    f: Callable[[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], TResult],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[[T12], Callable[[T13], TResult]],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry14[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[[T14], TResult],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry14[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TResult](
-    f: Callable[
-        [T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[[T13], Callable[[T14], TResult]],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry15[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[[T15], TResult],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry15[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[[T15], TResult],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry16[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[
-                                                                [T15],
-                                                                Callable[[T16], TResult],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-        T15,
-        T16,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-        a16: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)(a16)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry16[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[
-                                                            [T15],
-                                                            Callable[[T16], TResult],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: lambda a16: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry17[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[
-                                                                [T15],
-                                                                Callable[
-                                                                    [T16],
-                                                                    Callable[[T17], TResult],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-        T15,
-        T16,
-        T17,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-        a16: Any,
-        a17: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)(a16)(a17)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry17[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[
-                                                            [T15],
-                                                            Callable[
-                                                                [T16],
-                                                                Callable[[T17], TResult],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: lambda a16: lambda a17: f(
-                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry18[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[
-                                                                [T15],
-                                                                Callable[
-                                                                    [T16],
-                                                                    Callable[
-                                                                        [T17],
-                                                                        Callable[
-                                                                            [T18],
-                                                                            TResult,
-                                                                        ],
-                                                                    ],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-        T15,
-        T16,
-        T17,
-        T18,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-        a16: Any,
-        a17: Any,
-        a18: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)(a16)(a17)(a18)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry18[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-            T18,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[
-                                                            [T15],
-                                                            Callable[
-                                                                [T16],
-                                                                Callable[
-                                                                    [T17],
-                                                                    Callable[[T18], TResult],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: lambda a16: lambda a17: lambda a18: f(
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-                a16,
-                a17,
-                a18,
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry19[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[
-                                                                [T15],
-                                                                Callable[
-                                                                    [T16],
-                                                                    Callable[
-                                                                        [T17],
-                                                                        Callable[
-                                                                            [T18],
-                                                                            Callable[
-                                                                                [T19],
-                                                                                TResult,
-                                                                            ],
-                                                                        ],
-                                                                    ],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-        T15,
-        T16,
-        T17,
-        T18,
-        T19,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-        a16: Any,
-        a17: Any,
-        a18: Any,
-        a19: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)(a16)(a17)(a18)(a19)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry19[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-            T18,
-            T19,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[
-                                                            [T15],
-                                                            Callable[
-                                                                [T16],
-                                                                Callable[
-                                                                    [T17],
-                                                                    Callable[
-                                                                        [T18],
-                                                                        Callable[
-                                                                            [T19],
-                                                                            TResult,
-                                                                        ],
-                                                                    ],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: lambda a16: lambda a17: lambda a18: lambda a19: f(
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-                a16,
-                a17,
-                a18,
-                a19,
-            )
-        )
-    else:
-        return f2
-
-
-def uncurry20[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, TResult](
-    f: Callable[
-        [T1],
-        Callable[
-            [T2],
-            Callable[
-                [T3],
-                Callable[
-                    [T4],
-                    Callable[
-                        [T5],
-                        Callable[
-                            [T6],
-                            Callable[
-                                [T7],
-                                Callable[
-                                    [T8],
-                                    Callable[
-                                        [T9],
-                                        Callable[
-                                            [T10],
-                                            Callable[
-                                                [T11],
-                                                Callable[
-                                                    [T12],
-                                                    Callable[
-                                                        [T13],
-                                                        Callable[
-                                                            [T14],
-                                                            Callable[
-                                                                [T15],
-                                                                Callable[
-                                                                    [T16],
-                                                                    Callable[
-                                                                        [T17],
-                                                                        Callable[
-                                                                            [T18],
-                                                                            Callable[
-                                                                                [T19],
-                                                                                Callable[
-                                                                                    [T20],
-                                                                                    TResult,
-                                                                                ],
-                                                                            ],
-                                                                        ],
-                                                                    ],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-) -> Callable[
-    [
-        T1,
-        T2,
-        T3,
-        T4,
-        T5,
-        T6,
-        T7,
-        T8,
-        T9,
-        T10,
-        T11,
-        T12,
-        T13,
-        T14,
-        T15,
-        T16,
-        T17,
-        T18,
-        T19,
-        T20,
-    ],
-    TResult,
-]:
-    def f2(
-        a1: Any,
-        a2: Any,
-        a3: Any,
-        a4: Any,
-        a5: Any,
-        a6: Any,
-        a7: Any,
-        a8: Any,
-        a9: Any,
-        a10: Any,
-        a11: Any,
-        a12: Any,
-        a13: Any,
-        a14: Any,
-        a15: Any,
-        a16: Any,
-        a17: Any,
-        a18: Any,
-        a19: Any,
-        a20: Any,
-    ) -> Any:
-        return f(a1)(a2)(a3)(a4)(a5)(a6)(a7)(a8)(a9)(a10)(a11)(a12)(a13)(a14)(a15)(a16)(a17)(a18)(a19)(a20)
-
-    _curried[f2] = f
-    return f2
-
-
-def curry20[T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, TResult](
-    f: Callable[
-        [
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-            T18,
-            T19,
-            T20,
-        ],
-        TResult,
-    ],
-) -> Callable[
-    [T1],
-    Callable[
-        [T2],
-        Callable[
-            [T3],
-            Callable[
-                [T4],
-                Callable[
-                    [T5],
-                    Callable[
-                        [T6],
-                        Callable[
-                            [T7],
-                            Callable[
-                                [T8],
-                                Callable[
-                                    [T9],
-                                    Callable[
-                                        [T10],
-                                        Callable[
-                                            [T11],
-                                            Callable[
-                                                [T12],
-                                                Callable[
-                                                    [T13],
-                                                    Callable[
-                                                        [T14],
-                                                        Callable[
-                                                            [T15],
-                                                            Callable[
-                                                                [T16],
-                                                                Callable[
-                                                                    [T17],
-                                                                    Callable[
-                                                                        [T18],
-                                                                        Callable[
-                                                                            [T19],
-                                                                            Callable[
-                                                                                [T20],
-                                                                                TResult,
-                                                                            ],
-                                                                        ],
-                                                                    ],
-                                                                ],
-                                                            ],
-                                                        ],
-                                                    ],
-                                                ],
-                                            ],
-                                        ],
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ],
-]:
-    f2 = _curried.get(f)
-    if f2 is None:
-        return (
-            lambda a1: lambda a2: lambda a3: lambda a4: lambda a5: lambda a6: lambda a7: lambda a8: lambda a9: lambda a10: lambda a11: lambda a12: lambda a13: lambda a14: lambda a15: lambda a16: lambda a17: lambda a18: lambda a19: lambda a20: f(
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-                a16,
-                a17,
-                a18,
-                a19,
-                a20,
-            )
-        )
-    else:
-        return f2
-
-
-def is_array_like(x: Any) -> bool:
-    return isinstance(x, Array | list | tuple | set | bytes | bytearray)
-
-
-def is_disposable(x: Any) -> bool:
+def is_disposable(x: Any) -> TypeGuard[IDisposable]:
     return x is not None and isinstance(x, IDisposable)
 
 
@@ -2538,17 +539,10 @@ def dispose(x: IDisposable | AbstractContextManager[Any]) -> None:
     Also tries to call `__exit__` if the object turns out to be a Python resource manager.
     For more info see: https://www.python.org/dev/peps/pep-0310/
     """
-    try:
-        x.Dispose()  # type: ignore
-    except AttributeError as ex:
-        try:
-            x.__exit__(None, None, None)
-        except AttributeError:
-            raise ex
-
-
-class HashCode(Protocol):
-    def GetHashCode(self) -> int32: ...
+    if isinstance(x, IDisposable):
+        x.Dispose()
+    elif hasattr(x, "__exit__"):
+        x.__exit__(None, None, None)
 
 
 def is_hashable(x: Any) -> TypeGuard[HashCode]:
@@ -2559,18 +553,45 @@ def is_hashable_py(x: Any) -> bool:
     return hasattr(x, "__hash__") and callable(x.__hash__)
 
 
-def to_iterator[T](en: IEnumerator[T]) -> IEnumerator[T]:
-    class Iterator:
-        def __iter__(self):
-            return self
+def to_iterator[T](en: IEnumerator[T]) -> Iterator[T]:
+    """Convert an IEnumerator to a Python Iterator with proper disposal.
 
-        def __next__(self):
-            has_next = en.System_Collections_IEnumerator_MoveNext()
-            if not has_next:
-                raise StopIteration
-            return en.System_Collections_IEnumerator_get_Current()
+    This wraps an F# IEnumerator to make it a proper Python iterator
+    that can be used with for loops and other Python iteration protocols.
 
-    return Enumerator(Iterator())
+    The generator's finally block ensures Dispose() is called when:
+    - Iteration completes normally
+    - A break/return exits the loop early
+    - An exception is raised during iteration
+    - The iterator is garbage collected
+    """
+    try:
+        while en.System_Collections_IEnumerator_MoveNext():
+            yield en.System_Collections_IEnumerator_get_Current()
+    finally:
+        if hasattr(en, "Dispose"):
+            en.Dispose()
+
+
+def to_iterable[T](items: Iterable[T] | IEnumerable_1[T]) -> Iterable[T]:
+    """Convert IEnumerable_1 to Iterable if needed.
+
+    Prefers Python Iterable protocol (more efficient), falls back to GetEnumerator.
+    """
+    if isinstance(items, Iterable):
+        # Has Python iterator protocol, use it directly
+        yield from items
+    elif hasattr(items, "GetEnumerator"):
+        # It's an IEnumerable_1 without __iter__, iterate via the enumerator
+        en = items.GetEnumerator()
+        try:
+            while en.System_Collections_IEnumerator_MoveNext():
+                yield en.System_Collections_Generic_IEnumerator_1_get_Current()
+        finally:
+            if hasattr(en, "Dispose"):
+                en.Dispose()
+    else:
+        raise TypeError(f"Expected Iterable or IEnumerable_1, got {type(items)}")
 
 
 class ObjectRef:
@@ -2635,7 +656,7 @@ def structural_hash(x: Any) -> int32:
     return int32(hash(x))
 
 
-def array_hash(xs: list[Any]) -> int32:
+def array_hash(xs: Iterable[object]) -> int32:
     hashes: list[int32] = []
     for x in xs:
         hashes.append(structural_hash(x))
@@ -2647,7 +668,15 @@ def physical_hash(x: Any) -> int32:
     return number_hash(ObjectRef.id(x))
 
 
-def round(value: float64, digits: int = 0) -> float64:
+@overload
+def round(value: float32, digits: int = 0) -> float32: ...
+
+
+@overload
+def round(value: float64, digits: int = 0) -> float64: ...
+
+
+def round(value: float64 | float32, digits: int = 0) -> float64 | float32:
     return value.round(digits)
 
 
@@ -2780,8 +809,8 @@ class StaticPropertyMeta(ABCMeta):
     """Metaclass that enables StaticProperty descriptors to work with class-level
     assignment.
 
-    Note: We inherit from ABCMeta to be compatible when combined with classes that also
-    inherit from ABC, such as IDisposable.
+    Note: We inherit from type(Protocol) to be compatible when combined with classes
+    that inherit from Protocol (like IDisposable) or ABC.
     """
 
     def __setattr__(cls, name: str, value: Any) -> None:
@@ -2825,45 +854,43 @@ def range(start: int, stop: int, step: int = 1) -> Iterable[int32]:
         # For negative step, we want to include the stop value
         adjusted_stop = stop - 1
 
-    return map(lambda x: int32(x), builtins.range(start, adjusted_stop, step))
+    return (int32(x) for x in builtins.range(start, adjusted_stop, step))
 
 
 __all__ = [
+    "UNIT",
+    "AnonymousDisposable",
+    "ComparableBase",
+    "Disposable",
+    "DisposableBase",
+    "EnumerableBase",
+    "EnumeratorBase",
+    "EquatableBase",
+    "HashableBase",
+    "IDisposable",
+    "ObjectDisposedException",
     "ObjectRef",
     "PlatformID",
+    "SizedBase",
     "StaticLazyProperty",
     "StaticProperty",
     "StaticPropertyBase",
     "StaticPropertyMeta",
+    "StringableBase",
+    "Unit",
     "array_hash",
     "copy_to_array",
-    "curry2",
-    "curry3",
-    "curry4",
-    "curry5",
-    "curry6",
-    "curry7",
-    "curry8",
-    "curry9",
-    "curry10",
     "escape_data_string",
     "escape_uri_string",
     "get_platform",
     "identity_hash",
     "ignore",
+    "nullable",
     "number_hash",
     "physical_hash",
     "randint",
     "range",
     "round",
-    "uncurry2",
-    "uncurry3",
-    "uncurry4",
-    "uncurry5",
-    "uncurry6",
-    "uncurry7",
-    "uncurry8",
-    "uncurry9",
-    "uncurry10",
+    "to_iterable",
     "unescape_data_string",
 ]

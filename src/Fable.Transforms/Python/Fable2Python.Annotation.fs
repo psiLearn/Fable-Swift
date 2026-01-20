@@ -12,6 +12,20 @@ open Fable.Transforms.Python.AST
 open Fable.Transforms.Python.Types
 open Fable.Transforms.Python.Util
 
+/// Check if type is an inref wrapping a struct/value type.
+/// In F#, struct instance method's `this` parameter is represented as inref<StructType>,
+/// but in Python the struct is passed directly, not wrapped in FSharpRef.
+/// For regular inref<T> parameters (where T is a primitive or non-struct), we keep FSharpRef.
+let isStructInRefType (com: IPythonCompiler) =
+    function
+    | Replacements.Util.IsInRefType com innerType ->
+        match innerType with
+        | Fable.DeclaredType(entRef, _) ->
+            let ent = com.GetEntity(entRef)
+            ent.IsValueType
+        | _ -> false
+    | _ -> false
+
 let tryPyConstructor (com: IPythonCompiler) ctx ent =
     match Py.Replacements.tryConstructor com ent with
     | Some e -> com.TransformAsExpr(ctx, e) |> Some
@@ -46,14 +60,176 @@ let getRepeatedGenericTypeParams ctx (types: Fable.Type list) =
 let getGenericTypeParams (types: Fable.Type list) =
     types |> FSharp2Fable.Util.getGenParamNames |> Set.ofList
 
+/// Helper function to extract generic arguments from a type.
+/// Used for type narrowing casts and other type analysis.
+let getGenericArgs (typ: Fable.Type) : Fable.Type list =
+    match typ with
+    | Fable.DeclaredType(_, genArgs) -> genArgs
+    | Fable.Array(elementType, _) -> [ elementType ]
+    | Fable.List elementType -> [ elementType ]
+    | Fable.Option(elementType, _) -> [ elementType ]
+    | _ -> []
+
+/// Check if a type contains any generic parameters (recursively).
+/// Used to determine if Option<T> should use Option[T] annotation vs T | None.
+/// If the inner type contains generics, we need Option[T] because runtime may wrap.
+let containsGenericParams (t: Fable.Type) =
+    FSharp2Fable.Util.getGenParamNames [ t ] |> List.isEmpty |> not
+
+/// Check if a type contains Option nested inside a container (Array, List, Tuple).
+/// When Options are inside invariant containers, we must use Option[T] form consistently
+/// to match function signatures that use generic type parameters.
+let rec hasOptionInContainer (t: Fable.Type) : bool =
+    match t with
+    | Fable.Array(elementType, _) -> containsOptionType elementType
+    | Fable.List elementType -> containsOptionType elementType
+    | Fable.Tuple(genArgs, _) -> genArgs |> List.exists containsOptionType
+    | Fable.DeclaredType(_, genArgs) -> genArgs |> List.exists containsOptionType
+    | _ -> false
+
+/// Check if a type is or contains an Option type
+and containsOptionType (t: Fable.Type) : bool =
+    match t with
+    | Fable.Option _ -> true
+    | Fable.Array(elementType, _) -> containsOptionType elementType
+    | Fable.List elementType -> containsOptionType elementType
+    | Fable.Tuple(genArgs, _) -> genArgs |> List.exists containsOptionType
+    | Fable.DeclaredType(_, genArgs) -> genArgs |> List.exists containsOptionType
+    | _ -> false
+
+/// Check if a type is a callable type (Lambda or Delegate)
+let isCallableType (t: Fable.Type) =
+    match t with
+    | Fable.LambdaType _
+    | Fable.DelegateType _ -> true
+    | _ -> false
+
+/// Get the final (non-callable) return type from a nested callable type.
+/// For A -> B -> C -> int, returns int.
+let rec getFinalReturnType (t: Fable.Type) =
+    match t with
+    | Fable.LambdaType(_, returnType) -> getFinalReturnType returnType
+    | Fable.DelegateType(_, returnType) -> getFinalReturnType returnType
+    | _ -> t
+
+/// Get the immediate return type of a callable (one level deep).
+let getImmediateReturnType (t: Fable.Type) =
+    match t with
+    | Fable.LambdaType(_, returnType) -> returnType
+    | Fable.DelegateType(_, returnType) -> returnType
+    | _ -> t
+
+/// Generate type annotation for a callable (lambda) type.
+/// For nested callables:
+/// - If returned callable returns another callable: Callable[..., Any]
+/// - If returned callable returns concrete type: Callable[..., Callable[..., ConcreteType]]
+/// For simple callables (depth 1), preserves full type information.
+let makeLambdaTypeAnnotation
+    (com: IPythonCompiler)
+    ctx
+    (repeatedGenerics: Set<string> option)
+    (argType: Fable.Type)
+    (returnType: Fable.Type)
+    : Expression * Statement list
+    =
+    if isCallableType returnType then
+        // Check if the returned callable also returns a callable
+        let innerReturnType = getImmediateReturnType returnType
+
+        if isCallableType innerReturnType then
+            // Deeply nested: Callable[..., Any]
+            let any, stmts = stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+            stdlibModuleAnnotation com ctx "collections.abc" "Callable" [ Expression.ellipsis; any ], stmts
+        else
+            // Returned callable returns concrete type: Callable[..., Callable[..., ConcreteType]]
+            let concreteReturnExpr, stmts =
+                typeAnnotation com ctx repeatedGenerics innerReturnType
+
+            let innerCallable =
+                stdlibModuleAnnotation com ctx "collections.abc" "Callable" [ Expression.ellipsis; concreteReturnExpr ]
+
+            stdlibModuleAnnotation com ctx "collections.abc" "Callable" [ Expression.ellipsis; innerCallable ], stmts
+    else
+        // Simple case: Callable[[A], B] where B is not a callable - preserve full types
+        stdlibModuleTypeHint com ctx "collections.abc" "Callable" [ argType; returnType ] repeatedGenerics
+
 let getEntityGenParams (ent: Fable.Entity) =
     ent.GenericParameters |> Seq.map (fun x -> x.Name) |> Set.ofSeq
+
+/// Extract generic parameter names from a member's explicit generic parameters.
+/// Used for abstract interface methods and other cases with explicit type parameters.
+let getMemberGenParams (genParams: Fable.GenericParam list) =
+    genParams |> List.map (fun p -> p.Name) |> Set.ofList
+
+/// Create type parameters from a member's explicit generic parameters.
+/// Returns empty list if member has no generic parameters.
+/// Preserves type constraint bounds (e.g., 'T :> IDisposable becomes T: IDisposable in Python).
+let makeMemberTypeParams (com: IPythonCompiler) ctx (genParams: Fable.GenericParam list) : TypeParam list =
+    if genParams.Length > 0 then
+        makeTypeParamsFromGenParams com ctx genParams
+    else
+        []
+
+/// Try to convert a generic constraint type to its non-generic base type.
+/// Python 3.12+ TypeVar bounds cannot use parameterized generic types,
+/// so we map e.g., IEnumerable<'T> to IEnumerable (non-generic).
+let private tryGetNonGenericBase (target: Fable.Type) : Fable.Type option =
+    match target with
+    | Fable.DeclaredType(entRef, _genArgs) ->
+        match entRef.FullName with
+        // IEnumerable<T> -> IEnumerable (non-generic)
+        | Types.ienumerableGeneric ->
+            let nonGenericRef: Fable.EntityRef =
+                {
+                    FullName = Types.ienumerable
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                }
+
+            Some(Fable.DeclaredType(nonGenericRef, []))
+        // Add other mappings here as needed:
+        // Types.icomparableGeneric -> Types.icomparable, etc.
+        | _ -> None
+    | _ -> None
+
+/// Extract bound type from CoercesTo constraint if present.
+/// Returns the first CoercesTo constraint target type, or None if no such constraint exists.
+/// For bounds with generic parameters, attempts to use a non-generic base type instead,
+/// since Python 3.12+ TypeVar bounds cannot be parameterized.
+let tryGetCoercesToBound (constraints: Fable.Constraint list) : Fable.Type option =
+    constraints
+    |> List.tryPick (
+        function
+        | Fable.Constraint.CoercesTo target ->
+            // Python 3.12+ doesn't support parameterized generic types as bounds
+            // e.g., T: IEnumerable[U] is invalid, only T: SomeNonGenericType works
+            if containsGenericParams target then
+                // Try to use a non-generic base type instead
+                tryGetNonGenericBase target
+            else
+                Some target
+        | _ -> None
+    )
+
+/// Create a TypeParam with optional bound from a GenericParam's constraints.
+let makeTypeParamWithBound (com: IPythonCompiler) ctx (genParam: Fable.GenericParam) : TypeParam =
+    let name = genParam.Name.ToUpperInvariant() |> Helpers.clean |> Identifier
+
+    match tryGetCoercesToBound genParam.Constraints with
+    | Some boundType ->
+        let boundExpr, _stmts = typeAnnotation com ctx None boundType
+        TypeParam.typeVar (name, bound = boundExpr)
+    | None -> TypeParam.typeVar name
 
 let makeTypeParams (com: IPythonCompiler) ctx (genParams: Set<string>) : TypeParam list =
     // Python 3.12+ syntax: create TypeParam list for class/function declaration
     genParams
     |> Set.toList
     |> List.map (fun genParam -> TypeParam.typeVar (Identifier(genParam.ToUpperInvariant() |> Helpers.clean)))
+
+/// Create type parameters from GenericParam list, preserving constraint bounds.
+/// Use this when you have full GenericParam objects with constraint information.
+let makeTypeParamsFromGenParams (com: IPythonCompiler) ctx (genParams: Fable.GenericParam list) : TypeParam list =
+    genParams |> List.map (makeTypeParamWithBound com ctx)
 
 let makeFunctionTypeParams (com: IPythonCompiler) ctx (repeatedGenerics: Set<string>) : TypeParam list =
     // Python 3.12+ syntax: create TypeParam list for function declaration from repeated generics
@@ -63,38 +239,50 @@ let makeFunctionTypeParams (com: IPythonCompiler) ctx (repeatedGenerics: Set<str
     |> Set.toList
     |> List.map (fun genParam -> TypeParam.typeVar (Identifier(genParam)))
 
-let extractGenericParamsFromMethodSignature
+/// Create type parameters for a function, filtering by repeated generics and preserving constraint bounds.
+/// This version accepts the full GenericParam list to extract constraint information.
+let makeFunctionTypeParamsWithConstraints
     (com: IPythonCompiler)
     ctx
-    (args: Arguments)
-    (returnType: Expression)
-    : Set<string>
+    (genParams: Fable.GenericParam list)
+    (repeatedGenerics: Set<string>)
+    : TypeParam list
     =
-    // Extract generic type parameters from method signature by looking for single uppercase letter type names
-    let rec extractFromExpression (expr: Expression) : Set<string> =
-        match expr with
-        | Expression.Name { Id = Identifier name } when name.Length = 1 && System.Char.IsUpper(name.[0]) ->
-            Set.singleton name
-        | Expression.Subscript {
-                                   Value = value
-                                   Slice = slice
-                               } -> Set.union (extractFromExpression value) (extractFromExpression slice)
-        | Expression.Tuple { Elements = elements } -> elements |> List.map extractFromExpression |> Set.unionMany
-        | Expression.BinOp {
-                               Left = left
-                               Right = right
-                           } -> Set.union (extractFromExpression left) (extractFromExpression right)
-        | _ -> Set.empty
+    // Filter to only the generic params that are in the repeated set
+    let filteredParams =
+        genParams |> List.filter (fun p -> repeatedGenerics.Contains p.Name)
 
-    let argTypes =
-        args.Args
-        |> List.choose (fun arg -> arg.Annotation)
-        |> List.map extractFromExpression
-        |> Set.unionMany
+    // For params that exist in genParams, use the constraint-aware version
+    // For params only known by name (from signature), create without bounds
+    let paramsWithConstraints =
+        filteredParams |> List.map (makeTypeParamWithBound com ctx)
 
-    let returnTypes = extractFromExpression returnType
+    // Find names that are in repeatedGenerics but not in genParams (signature-only generics)
+    let explicitNames = genParams |> List.map (fun p -> p.Name) |> Set.ofList
 
-    Set.union argTypes returnTypes
+    let signatureOnlyParams =
+        repeatedGenerics
+        |> Set.filter (fun name -> not (explicitNames.Contains name))
+        |> Set.toList
+        |> List.map (fun genParam -> genParam.ToUpperInvariant() |> Helpers.clean |> Identifier |> TypeParam.typeVar)
+
+    paramsWithConstraints @ signatureOnlyParams
+
+/// Calculate type parameters for a method from its Fable argument and return types.
+/// This is used for object expression methods and other cases where we need to derive
+/// type parameters from the method signature.
+let calculateMethodTypeParams
+    (com: IPythonCompiler)
+    ctx
+    (argTypes: Fable.Type list)
+    (returnType: Fable.Type)
+    : TypeParam list
+    =
+    let repeatedGenerics =
+        getRepeatedGenericTypeParams ctx (argTypes @ [ returnType ]) |> Set.difference
+        <| ctx.ScopedTypeParams
+
+    makeFunctionTypeParams com ctx repeatedGenerics
 
 let private libReflectionCall (com: IPythonCompiler) ctx r memberName args =
     libCall com ctx r "reflection" (memberName + "_type") args
@@ -118,11 +306,16 @@ let stdlibModuleAnnotation (com: IPythonCompiler) ctx moduleName memberName args
             match args with
             | Expression.Name { Id = Identifier Ellipsis } :: _xs -> Expression.ellipsis
             | _ ->
-                args
-                |> List.removeAt (args.Length - 1)
+                let argsWithoutReturn = args |> List.removeAt (args.Length - 1)
+
+                argsWithoutReturn
                 |> List.choose (
                     function
-                    | Expression.Name { Id = Identifier "None" } when args.Length = 2 -> None
+                    // Filter out None (unit) only when it's the sole argument.
+                    // F# `unit -> T` means "takes no args" in Python: Callable[[], T]
+                    // But `unit -> 'a -> T` uncurried to `(unit, 'a) -> T` must keep
+                    // None to match the actual function signature with unit parameter.
+                    | Expression.Name { Id = Identifier "None" } when argsWithoutReturn.Length = 1 -> None
                     | x -> Some x
                 )
                 |> Expression.list
@@ -136,8 +329,8 @@ let fableModuleTypeHint com ctx moduleName memberName genArgs repeatedGenerics =
     let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
     fableModuleAnnotation com ctx moduleName memberName resolved, stmts
 
-let stdlibModuleTypeHint com ctx moduleName memberName genArgs =
-    let resolved, stmts = resolveGenerics com ctx genArgs None
+let stdlibModuleTypeHint com ctx moduleName memberName genArgs repeatedGenerics =
+    let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
     stdlibModuleAnnotation com ctx moduleName memberName resolved, stmts
 
 let makeGenTypeParamInst com ctx (genArgs: Fable.Type list) (repeatedGenerics: Set<string> option) =
@@ -190,12 +383,28 @@ let makeGenericTypeAnnotation'
 
         Expression.subscript (name, Expression.tuple genArgs)
 
+/// Creates a subscript expression for generic type parameters from a list of names.
+/// For a single param, returns just the name; for multiple, returns a tuple.
+/// E.g., [] -> baseExpr, [T] -> baseExpr[T], [T1, T2] -> baseExpr[T1, T2]
+let makeGenericParamSubscript (genParamNames: string list) (baseExpr: Expression) =
+    if List.isEmpty genParamNames then
+        baseExpr
+    else
+        let genArgs = genParamNames |> List.map Expression.name
+
+        let slice =
+            match genArgs with
+            | [ single ] -> single
+            | multiple -> Expression.tuple multiple
+
+        Expression.subscript (baseExpr, slice)
+
 let resolveGenerics com ctx generics repeatedGenerics : Expression list * Statement list =
     generics
     |> List.map (typeAnnotation com ctx repeatedGenerics)
     |> Helpers.unzipArgs
 
-let typeAnnotation
+let rec typeAnnotation
     (com: IPythonCompiler)
     ctx
     (repeatedGenerics: Set<string> option)
@@ -205,15 +414,15 @@ let typeAnnotation
     // printfn "typeAnnotation: %A" (t, repeatedGenerics)
     match t with
     | Fable.Measure _
-    | Fable.Any -> stdlibModuleTypeHint com ctx "typing" "Any" []
+    | Fable.Any -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
     | Fable.GenericParam(name = name) when name.StartsWith("$$", StringComparison.Ordinal) ->
-        stdlibModuleTypeHint com ctx "typing" "Any" []
+        stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
     | Fable.GenericParam(name = name) ->
         match repeatedGenerics with
         | Some names when names.Contains name ->
             let name = Helpers.clean name
             com.AddTypeVar(ctx, name), []
-        | Some _ -> stdlibModuleTypeHint com ctx "typing" "Any" []
+        | Some _ -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
         | None ->
             let name = Helpers.clean name
             com.AddTypeVar(ctx, name), []
@@ -222,11 +431,9 @@ let typeAnnotation
     | Fable.Char -> Expression.name "str", []
     | Fable.String -> Expression.name "str", []
     | Fable.Number(kind, info) -> makeNumberTypeAnnotation com ctx kind info
-    | Fable.LambdaType(argType, returnType) ->
-        let argTypes, returnType = uncurryLambdaType -1 [ argType ] returnType
-        stdlibModuleTypeHint com ctx "collections.abc" "Callable" (argTypes @ [ returnType ])
+    | Fable.LambdaType(argType, returnType) -> makeLambdaTypeAnnotation com ctx repeatedGenerics argType returnType
     | Fable.DelegateType(argTypes, returnType) ->
-        stdlibModuleTypeHint com ctx "collections.abc" "Callable" (argTypes @ [ returnType ])
+        stdlibModuleTypeHint com ctx "collections.abc" "Callable" (argTypes @ [ returnType ]) repeatedGenerics
     | Fable.Nullable(genArg, isStruct) ->
         if isStruct then
             // For nullable value types, use T | None pattern similar to Option but without special handling
@@ -235,31 +442,43 @@ let typeAnnotation
         else
             typeAnnotation com ctx repeatedGenerics genArg // nullable reference types are erased
     | Fable.Option(Fable.Unit, _) ->
-        // unit option -> just None instead of None | None
-        Expression.none, []
+        // unit option -> Option[None] since it can be some(None) or None
+        fableModuleAnnotation com ctx "option" "Option" [ Expression.none ], []
     | Fable.Option(genArg, _) ->
-        // Check if this is a nested option (Option<Option<T>>)
+        // Must match mustWrapOption logic in Transforms.Util.fs
+        // Wrap when: Any, Unit, GenericParam, nested Option, or callable with generic params
         match genArg with
-        | Fable.Option(_, _) ->
-            // This is Option<Option<T>>, use the full Option type annotation
+        | Fable.Option _
+        | Fable.Any
+        | Fable.Unit
+        | Fable.GenericParam _ ->
+            // Use full Option type annotation (code will use SomeWrapper)
             let resolved, stmts = resolveGenerics com ctx [ genArg ] repeatedGenerics
-            fableModuleAnnotation com ctx "option" "Option" resolved, []
+            fableModuleAnnotation com ctx "option" "Option" resolved, stmts
+        | Fable.LambdaType _
+        | Fable.DelegateType _ when containsGenericParams genArg ->
+            // Callable types with generic parameters (e.g., Callable[[_A], _B])
+            // Must use Option[T] form because runtime wraps with SomeWrapper
+            let resolved, stmts = resolveGenerics com ctx [ genArg ] repeatedGenerics
+            fableModuleAnnotation com ctx "option" "Option" resolved, stmts
         | _ ->
-            // This is a simple Option<T>, use erased form T | None
-            let innerType, stmts = typeAnnotation com ctx repeatedGenerics genArg
-            Expression.binOp (innerType, BinaryOrBitwise, Expression.none), stmts
-    | Fable.Tuple(genArgs, _) -> makeGenericTypeAnnotation com ctx "tuple" genArgs None, []
-    | Fable.Array(genArg, Fable.ArrayKind.ResizeArray) -> makeGenericTypeAnnotation com ctx "list" [ genArg ] None, []
+            // For concrete types (including DeclaredTypes with generics like FSharpList[T]),
+            // erase to T | None (simpler, no wrapper needed)
+            let resolved, stmts = typeAnnotation com ctx repeatedGenerics genArg
+            Expression.binOp (resolved, BitOr, Expression.none), stmts
+    | Fable.Tuple(genArgs, _) -> makeGenericTypeAnnotation com ctx "tuple" genArgs repeatedGenerics, []
+    | Fable.Array(genArg, Fable.ArrayKind.ResizeArray) ->
+        makeGenericTypeAnnotation com ctx "list" [ genArg ] repeatedGenerics, []
     | Fable.Array(genArg, _) -> fableModuleTypeHint com ctx "array_" "Array" [ genArg ] repeatedGenerics
     | Fable.List genArg -> fableModuleTypeHint com ctx "list" "FSharpList" [ genArg ] repeatedGenerics
-    | Replacements.Util.Builtin kind -> makeBuiltinTypeAnnotation com ctx kind repeatedGenerics
+    | Replacements.Util.Builtin kind as typ -> makeBuiltinTypeAnnotation com ctx typ repeatedGenerics kind
     | Fable.AnonymousRecordType(_, _genArgs, _) ->
         let value = Expression.name "dict"
-        let any, stmts = stdlibModuleTypeHint com ctx "typing" "Any" []
+        let any, stmts = stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
 
         Expression.subscript (value, Expression.tuple [ Expression.name "str"; any ]), stmts
     | Fable.DeclaredType(entRef, genArgs) -> makeEntityTypeAnnotation com ctx entRef genArgs repeatedGenerics
-    | _ -> stdlibModuleTypeHint com ctx "typing" "Any" []
+    | _ -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
 
 let makeNumberTypeAnnotation com ctx kind info =
     let numberInfo kind =
@@ -286,11 +505,11 @@ let makeNumberTypeAnnotation com ctx kind info =
         match name with
         | "int"
         | "float" -> Expression.name name
-        | _ -> fableModuleAnnotation com ctx "types" name []
+        | _ -> fableModuleAnnotation com ctx "core" name []
 
 
     match kind, info with
-    | Decimal, _ -> stdlibModuleTypeHint com ctx "decimal" "Decimal" []
+    | Decimal, _ -> stdlibModuleTypeHint com ctx "decimal" "Decimal" [] None
     | _ -> numberInfo kind, []
 
 let makeImportTypeId (com: IPythonCompiler) ctx moduleName typeName =
@@ -307,10 +526,12 @@ let makeImportTypeAnnotation com ctx genArgs moduleName typeName =
 let makeEntityTypeAnnotation com ctx (entRef: Fable.EntityRef) genArgs repeatedGenerics =
     // printfn "DeclaredType: %A" entRef.FullName
     match entRef.FullName, genArgs with
+    // Python's BaseException - used for catch-all exception handlers
+    | "BaseException", _ -> Expression.name "BaseException", []
     | Types.result, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
         fableModuleAnnotation com ctx "result" "FSharpResult_2" resolved, stmts
-    | Replacements.Util.BuiltinEntity _kind -> stdlibModuleTypeHint com ctx "typing" "Any" []
+    | Replacements.Util.BuiltinEntity _kind -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
     (*
         | Replacements.Util.BclGuid
         | Replacements.Util.BclTimeSpan
@@ -330,63 +551,102 @@ let makeEntityTypeAnnotation com ctx (entRef: Fable.EntityRef) genArgs repeatedG
     | Types.fsharpAsyncGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
         fableModuleAnnotation com ctx "async_builder" "Async" resolved, stmts
-    | Types.taskGeneric, _ -> stdlibModuleTypeHint com ctx "typing" "Awaitable" genArgs
-    | Types.icomparable, _ -> libValue com ctx "util" "IComparable", []
-    | Types.iStructuralEquatable, _ -> libValue com ctx "util" "IStructuralEquatable", []
-    | Types.iStructuralComparable, _ -> libValue com ctx "util" "IStructuralComparable", []
+    | Types.taskGeneric, _ -> stdlibModuleTypeHint com ctx "collections.abc" "Awaitable" genArgs repeatedGenerics
+    | Types.icomparable, _ -> libValue com ctx "protocols" "IComparable", []
+    | Types.iStructuralEquatable, _ -> libValue com ctx "protocols" "IStructuralEquatable", []
+    | Types.iStructuralComparable, _ -> libValue com ctx "protocols" "IStructuralComparable", []
     | Types.icomparerGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "IComparer_1" resolved, stmts
-    | Types.iequalityComparer, _ -> libValue com ctx "util" "IEqualityComparer", []
+        fableModuleAnnotation com ctx "protocols" "IComparer_1" resolved, stmts
+    | Types.iequalityComparer, _ -> libValue com ctx "protocols" "IEqualityComparer", []
     | Types.iequalityComparerGeneric, _ ->
-        let resolved, stmts = stdlibModuleTypeHint com ctx "typing" "Any" []
-        fableModuleAnnotation com ctx "util" "IEqualityComparer_1" [ resolved ], stmts
+        let resolved, stmts =
+            stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+
+        fableModuleAnnotation com ctx "protocols" "IEqualityComparer_1" [ resolved ], stmts
     | Types.ienumerator, _ ->
-        let resolved, stmts = stdlibModuleTypeHint com ctx "typing" "Any" []
-        fableModuleAnnotation com ctx "util" "IEnumerator" [ resolved ], stmts
+        let resolved, stmts =
+            stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+
+        fableModuleAnnotation com ctx "protocols" "IEnumerator" [ resolved ], stmts
     | Types.ienumeratorGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "IEnumerator" resolved, stmts
-    | Types.ienumerable, _ -> fableModuleAnnotation com ctx "util" "IEnumerable" [], []
+        fableModuleAnnotation com ctx "protocols" "IEnumerator" resolved, stmts
+    | Types.ienumerable, _ -> fableModuleAnnotation com ctx "protocols" "IEnumerable" [], []
     | Types.ienumerableGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "IEnumerable_1" resolved, stmts
+        fableModuleAnnotation com ctx "protocols" "IEnumerable_1" resolved, stmts
     | Types.iequatableGeneric, _ ->
-        let resolved, stmts = stdlibModuleTypeHint com ctx "typing" "Any" []
-        fableModuleAnnotation com ctx "util" "IEquatable" [ resolved ], stmts
+        let resolved, stmts =
+            stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+
+        fableModuleAnnotation com ctx "protocols" "IEquatable" [ resolved ], stmts
     | Types.icomparableGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "IComparable_1" resolved, stmts
+        fableModuleAnnotation com ctx "protocols" "IComparable_1" resolved, stmts
     | Types.icollection, _
     | Types.icollectionGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "ICollection" resolved, stmts
-    | Types.idisposable, _ -> libValue com ctx "util" "IDisposable", []
+        fableModuleAnnotation com ctx "protocols" "ICollection" resolved, stmts
+    | Types.ilist, _
+    | Types.ilistGeneric, _ ->
+        // Map IList<T> to MutableSequence[T] which both list and FSharpArray implement
+        stdlibModuleTypeHint com ctx "collections.abc" "MutableSequence" genArgs repeatedGenerics
+    | Types.idisposable, _ -> libValue com ctx "protocols" "IDisposable", []
     | Types.iobserverGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
         fableModuleAnnotation com ctx "observable" "IObserver" resolved, stmts
     | Types.iobservableGeneric, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
         fableModuleAnnotation com ctx "observable" "IObservable" resolved, stmts
-    | Types.idictionary, _ ->
-        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "util" "IDictionary" resolved, stmts
+    | Types.idictionary, _ -> stdlibModuleTypeHint com ctx "collections.abc" "Mapping" genArgs repeatedGenerics
     | Types.ievent2, _ ->
-        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
-        fableModuleAnnotation com ctx "event" "IEvent_2" resolved, stmts
+        // IEvent<'Delegate, 'Args> - only use Args (second param) since Delegate is phantom in Python
+        let argsType = genArgs |> List.tryItem 1 |> Option.defaultValue Fable.Any
+        let resolved, stmts = resolveGenerics com ctx [ argsType ] repeatedGenerics
+        fableModuleAnnotation com ctx "event" "IEvent" resolved, stmts
     | Types.cancellationToken, _ -> libValue com ctx "async_builder" "CancellationToken", []
     | Types.mailboxProcessor, _ ->
         let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
         fableModuleAnnotation com ctx "mailbox_processor" "MailboxProcessor" resolved, stmts
+    // IFormatProvider is not used in Python, just map to Any
+    | "System.IFormatProvider", _ -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+    // Py.Set/Map are used because fable-library-py reuses Set.fs/Map.fs from the ts folder
+    | "Fable.Core.Py.Set`1", _ ->
+        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
+        fableModuleAnnotation com ctx "protocols" "ISet_1" resolved, stmts
+    | "Py.Mapping.IMapping`2", _ ->
+        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
+        fableModuleAnnotation com ctx "protocols" "IMap" resolved, stmts
     | "Fable.Core.Py.Callable", _ ->
-        let any, stmts = stdlibModuleTypeHint com ctx "typing" "Any" []
+        let any, stmts = stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
         let genArgs = [ Expression.ellipsis; any ]
 
         stdlibModuleAnnotation com ctx "collections.abc" "Callable" genArgs, stmts
+    | "Fable.Core.Py.Iterator`1", _ ->
+        // Py.Iterator<'T> maps to collections.abc.Iterator[T]
+        stdlibModuleTypeHint com ctx "collections.abc" "Iterator" genArgs repeatedGenerics
+    | "Fable.Library.Python.Atom", _ ->
+        // Atom[T] is a callable wrapper for mutable module-level values
+        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
+        fableModuleAnnotation com ctx "util" "Atom" resolved, stmts
     | _ ->
         let ent = com.GetEntity(entRef)
         // printfn "DeclaredType: %A" ent.FullName
-        if ent.IsInterface then
+        // Erased interfaces (with [<Erase>] attribute) don't exist at runtime, use Any
+        let isErased =
+            ent.Attributes |> Seq.exists (fun att -> att.Entity.FullName = Atts.erase)
+
+        // Check for [<Global>] attribute - use the global name directly as the type annotation
+        match com, ent.Attributes with
+        | FSharp2Fable.Util.GlobalAtt(Some customName) ->
+            // Use the custom global name (e.g., "list" for [<Global("list")>])
+            makeGenericTypeAnnotation com ctx customName genArgs repeatedGenerics, []
+        | FSharp2Fable.Util.GlobalAtt None ->
+            // Use the entity's display name
+            let name = Helpers.removeNamespace ent.FullName
+            makeGenericTypeAnnotation com ctx name genArgs repeatedGenerics, []
+        | _ when ent.IsInterface && not isErased ->
             let name = Helpers.removeNamespace ent.FullName
 
             // If the interface is imported then it's erased and we need to add the actual imports
@@ -402,7 +662,10 @@ let makeEntityTypeAnnotation com ctx (entRef: Fable.EntityRef) genArgs repeatedG
                 | _ -> ()
 
             makeGenericTypeAnnotation com ctx name genArgs repeatedGenerics, []
-        else
+        | _ when isErased ->
+            // Erased types should use Any for type annotations
+            stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+        | _ ->
             match tryPyConstructor com ctx ent with
             | Some(entRef, stmts) ->
                 match entRef with
@@ -414,17 +677,52 @@ let makeEntityTypeAnnotation com ctx (entRef: Fable.EntityRef) genArgs repeatedG
                     | "string" -> StringTypeAnnotation
                     | _ -> AnyTypeAnnotation*)
                 | Expression.Name { Id = Identifier id } ->
-                    makeGenericTypeAnnotation com ctx id genArgs repeatedGenerics, stmts
-                // TODO: Resolve references to types in nested modules
-                | _ -> stdlibModuleTypeHint com ctx "typing" "Any" []
-            | None -> stdlibModuleTypeHint com ctx "typing" "Any" []
+                    // For F# union types, tryPyConstructor returns the underscore-prefixed base class
+                    // name (e.g., "_MyUnion"). For type annotations:
+                    // - Inside base class definition: use base class name (_MyUnion)
+                    // - Elsewhere: use type alias (MyUnion) for public API
+                    let isInsideThisUnionBaseClass =
+                        match ctx.EnclosingUnionBaseClass with
+                        | Some enclosingName -> ent.DisplayName = enclosingName
+                        | None -> false
 
-let makeBuiltinTypeAnnotation com ctx kind repeatedGenerics =
+                    let annotationName =
+                        if
+                            ent.IsFSharpUnion
+                            && id.StartsWith("_", StringComparison.Ordinal)
+                            && not isInsideThisUnionBaseClass
+                        then
+                            // Outside base class - use type alias (strip underscore)
+                            id.Substring(1)
+                        else
+                            // Inside base class or not a union - use as-is
+                            id
+
+                    // Import the type if it's from another file
+                    if ent.IsFSharpUnion then
+                        match ent.Ref.SourcePath with
+                        | Some path when path <> com.CurrentFile ->
+                            let importPath = Path.getRelativeFileOrDirPath false com.CurrentFile false path
+                            com.GetImportExpr(ctx, importPath, annotationName) |> ignore
+                        | _ -> ()
+
+                    makeGenericTypeAnnotation com ctx annotationName genArgs repeatedGenerics, stmts
+                // TODO: Resolve references to types in nested modules
+                | _ -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+            | None -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
+
+let makeBuiltinTypeAnnotation com ctx typ repeatedGenerics kind =
     match kind with
-    | Replacements.Util.BclGuid -> Expression.name "str", []
+    | Replacements.Util.BclGuid -> stdlibModuleTypeHint com ctx "uuid" "UUID" [] repeatedGenerics
     | Replacements.Util.FSharpReference genArg ->
-        let resolved, stmts = resolveGenerics com ctx [ genArg ] repeatedGenerics
-        fableModuleAnnotation com ctx "types" "FSharpRef" resolved, stmts
+        // For struct instance methods, `this` is represented as inref<StructType> in F#,
+        // but in Python the struct is passed directly, not wrapped in FSharpRef.
+        // For regular byref/inref/outref parameters, we use FSharpRef.
+        if isStructInRefType com typ then
+            typeAnnotation com ctx repeatedGenerics genArg
+        else
+            let resolved, stmts = resolveGenerics com ctx [ genArg ] repeatedGenerics
+            fableModuleAnnotation com ctx "core" "FSharpRef" resolved, stmts
     (*
     | Replacements.Util.BclTimeSpan -> NumberTypeAnnotation
     | Replacements.Util.BclDateTime -> makeSimpleTypeAnnotation com ctx "Date"
@@ -447,10 +745,20 @@ let makeBuiltinTypeAnnotation com ctx kind repeatedGenerics =
         let resolved, stmts = resolveGenerics com ctx [ ok; err ] repeatedGenerics
 
         fableModuleAnnotation com ctx "result" "FSharpResult_2" resolved, stmts
-    | _ -> stdlibModuleTypeHint com ctx "typing" "Any" []
+    | Replacements.Util.FSharpChoice genArgs ->
+        let resolved, stmts = resolveGenerics com ctx genArgs repeatedGenerics
+        // Use the type alias (clean name without underscore prefix)
+        let name = $"FSharpChoice_%d{List.length genArgs}"
+        fableModuleAnnotation com ctx "choice" name resolved, stmts
+    | _ -> stdlibModuleTypeHint com ctx "typing" "Any" [] repeatedGenerics
 
-let transformFunctionWithAnnotations (com: IPythonCompiler) ctx name (args: Fable.Ident list) (body: Fable.Expr) =
-    // printfn "transformFunctionWithAnnotations: %A" (name, args, body.Type)
+let transformFunctionWithAnnotations
+    (com: IPythonCompiler)
+    ctx
+    (name: string option)
+    (args: Fable.Ident list)
+    (body: Fable.Expr)
+    =
     let argTypes = args |> List.map _.Type
 
     // In Python a generic type arg must appear both in the argument and the return type (cannot appear only once)
@@ -460,14 +768,11 @@ let transformFunctionWithAnnotations (com: IPythonCompiler) ctx name (args: Fabl
 
     let returnType, stmts = typeAnnotation com ctx (Some repeatedGenerics) body.Type
 
-    // If the only argument is generic, then we make the return type optional as well
-    let returnType' =
-        // printfn "Generic params: %A" (args, repeatedGenerics, body.Type)
-        match args, body.Type with
-        | [ { Type = Fable.GenericParam(name = x) } ], Fable.GenericParam(name = y) when
-            x = y && Set.contains x repeatedGenerics
-            ->
-            Expression.binOp (returnType, BinaryOrBitwise, Expression.none)
-        | _ -> returnType
+    // Calculate type parameters for generic functions (excluding already scoped params)
+    let typeParams =
+        Set.difference repeatedGenerics ctx.ScopedTypeParams
+        |> makeFunctionTypeParams com ctx
 
-    args', stmts @ body', returnType'
+    // Return type stays as T (not T | None) since we use Unit as default value
+    // which preserves generic constraints: def foo[T](x: T = Unit) -> T
+    args', stmts @ body', returnType, typeParams

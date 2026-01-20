@@ -264,7 +264,7 @@ let ``test emitPyExpr works without parameters`` () =
     hello |> equal "Hello"
 
 // This function needs to be at the root level to avoid being mangled
-let factorial (count : int) : int =
+let factorial (count : nativeint) : nativeint =
     emitPyStatement
         count
         """if $0 < 2:
@@ -279,28 +279,28 @@ let ``test emitPyStatement works with parameters`` () =
 
 
 type NativeCode =
-    abstract add5: int -> int
+    abstract add5: nativeint -> nativeint
 
 [<Fact>]
 let ``test importAll`` () =
     let nativeCode: NativeCode = importAll ".py.native_code"
-    3 |> nativeCode.add5 |> equal 8
+    3n |> nativeCode.add5 |> equal 8n
 
 // Deliberately using legacy relative path syntax to ensure it still works
-let add5 (x: int): int = importMember "./py/native_code.py"
+let add5 (x: nativeint): nativeint = importMember "./py/native_code.py"
 
 [<Fact>]
 let ``test importMember`` () =
     add5 -1 |> equal 4
 
     // Cannot use the same name as Fable will mangle the identifier
-    let add7: int -> int = importMember ".py.native_code"
+    let add7: nativeint -> nativeint = importMember ".py.native_code"
     add7 12 |> equal 19
 
-    let add5': int -> int = import "add5" ".py.native_code"
+    let add5': nativeint -> nativeint = import "add5" ".py.native_code"
     add5' 12 |> equal 17
 
-    let multiply3 (x: int): int = importMember ".py.more_native_code"
+    let multiply3 (x: nativeint): nativeint = importMember ".py.more_native_code"
     multiply3 9 |> equal 27
 
 [<ImportAll(".py.native_code")>]
@@ -308,7 +308,7 @@ let nativeCode: NativeCode = nativeOnly
 
 [<Fact>]
 let ``test ImportAll works with relative paths`` () = // See #3481
-    3 |> nativeCode.add5 |> equal 8
+    3n |> nativeCode.add5 |> equal 8n
 
 [<Fact>]
 let ``test StringEnum attribute works`` () =
@@ -356,7 +356,7 @@ let ``test StringEnums can have static members`` () =
 type ITestService =
     [<ParamObject(1)>]
     [<EmitMethod("process")>]
-    abstract process: data: string * ?verbose:bool -> string
+    abstract proc: data: string * ?verbose:bool -> string
 
 // Create a test implementation that tracks keyword arguments
 [<Emit("""
@@ -374,7 +374,7 @@ let testService: ITestService = nativeOnly
 [<Fact>]
 let ``test ParamObject with EmitMethod preserves arguments`` () =
     // Test that EmitMethod + ParamObject preserves keyword arguments
-    let result = testService.process("test", verbose = true)
+    let result = testService.proc("test", verbose = true)
     result.Contains("verbose") |> equal true
 
 // Test for ParamObject with EmitConstructor issue #3871 (continuation of PR #4158)
@@ -566,14 +566,14 @@ let ``test multiple decorators applied in correct order`` () =
 [<Py.ClassAttributes(style=Py.ClassAttributeStyle.Attributes, init=false)>]
 type AttrsDecoratedClass() =
     member val Data: string = "attrs_data" with get, set
-    member val Count: int = 42 with get, set
+    member val Count: nativeint = 42n with get, set
 
 [<Fact>]
 let ``test complex decorator parameters`` () =
     // Test decorator with complex parameter syntax
     let obj = AttrsDecoratedClass()
     obj.Data |> equal "attrs_data"
-    obj.Count |> equal 42
+    obj.Count |> equal 42n
 
 // Test combining Decorate with existing F# features
 

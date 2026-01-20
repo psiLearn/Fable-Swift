@@ -4,8 +4,8 @@ import builtins
 from base64 import b64decode, b64encode
 from typing import Any
 
-from .core import strings
-from .types import Array
+from .array_ import Array
+from .core import byte, int32, strings
 
 
 # Re-export classes from core.strings
@@ -23,7 +23,6 @@ initialize = strings.initialize
 insert = strings.insert
 is_null_or_empty = strings.is_null_or_empty
 is_null_or_white_space = strings.is_null_or_white_space
-concat = strings.concat
 join = strings.join
 pad_left = strings.pad_left
 pad_right = strings.pad_right
@@ -36,6 +35,9 @@ trim = strings.trim
 trim_start = strings.trim_start
 trim_end = strings.trim_end
 filter = strings.filter
+map = strings.map
+map_indexed = strings.map_indexed
+collect = strings.collect
 substring = strings.substring
 to_char_array2 = strings.to_char_array2
 compare = strings.compare
@@ -46,8 +48,13 @@ last_index_of = strings.last_index_of
 interpolate = strings.interpolate
 
 
+def concat(*strings: str) -> str:
+    """Concatenate strings using native Python join for performance."""
+    return "".join(strings)
+
+
 # Additional helper functions that might be needed for backward compatibility
-def to_console_error(arg: Any) -> None:
+def to_console_error(arg: Any) -> Any:
     """Print to console error stream."""
 
     def print_func(x: str) -> None:
@@ -56,7 +63,7 @@ def to_console_error(arg: Any) -> None:
     return continue_print(print_func, arg)
 
 
-def to_fail(arg: Any) -> None:
+def to_fail(arg: Any) -> Any:
     """Fail with message."""
 
     def fail(msg: str) -> None:
@@ -66,17 +73,17 @@ def to_fail(arg: Any) -> None:
 
 
 # Utility functions for base64 encoding/decoding
-def to_base64string(in_array: Array[int]) -> str:
+def to_base64string(in_array: Array[Any]) -> str:
     """Convert byte array to base64 string."""
     return b64encode(bytes(in_array)).decode("utf8")
 
 
-def from_base64string(b64encoded: str) -> Array[int]:
+def from_base64string(b64encoded: str) -> Array[byte]:
     """Convert base64 string to byte array."""
-    return Array[int](b64decode(b64encoded))
+    return Array[Any](b64decode(b64encoded))  # Use Any to avoid byte/int issues
 
 
-def join_with_indices(delimiter: str, xs: list[str], startIndex: int, count: int) -> str:
+def join_with_indices(delimiter: str, xs: Array[str], startIndex: int, count: int) -> str:
     """Join strings with start index and count."""
     endIndexPlusOne = startIndex + count
     if endIndexPlusOne > len(xs):
@@ -107,8 +114,8 @@ def starts_with_exact(string: str, pattern: str) -> bool:
     return idx == 0
 
 
-def index_of_any(string: str, any_of: list[str], *args: int) -> int:
-    """Find index of any character from the list."""
+def index_of_any(string: str, any_of: Array[str], *args: int) -> int:
+    """Find index of any character from the array."""
     if not string:
         return -1
 
@@ -132,9 +139,15 @@ def index_of_any(string: str, any_of: list[str], *args: int) -> int:
     return -1
 
 
+def get_length(string: str) -> int32:
+    """Get string length as int32 for F# interop."""
+    return int32(len(string))
+
+
 __all__ = [
     "IPrintfFormat",
     "StringComparison",
+    "collect",
     "compare",
     "compare_to",
     "concat",
@@ -146,6 +159,7 @@ __all__ = [
     "format_replacement",
     "from_base64string",
     "get_char_at_index",
+    "get_length",
     "index_of",
     "index_of_any",
     "initialize",
@@ -156,6 +170,8 @@ __all__ = [
     "join",
     "join_with_indices",
     "last_index_of",
+    "map",
+    "map_indexed",
     "not_supported",
     "pad_left",
     "pad_right",

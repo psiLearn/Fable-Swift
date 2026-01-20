@@ -11,22 +11,33 @@ open Fable.Transforms.Printer
 module PrinterExtensions =
     type Printer with
 
+        /// Print a single type parameter (Python 3.12+ syntax)
+        /// Handles bounds: T: SomeType
+        member printer.PrintTypeParam(tp: TypeParam) =
+            match tp with
+            | TypeVar tv ->
+                printer.Print tv.Name
+
+                match tv.Bound with
+                | Some bound ->
+                    printer.Print ": "
+                    printer.Print bound
+                | None -> ()
+            | ParamSpec ps -> printer.Print ps.Name
+            | TypeVarTuple tvt -> printer.Print tvt.Name
+
         /// Print type parameters if any (Python 3.12+ syntax)
         member printer.PrintTypeParams(typeParams: TypeParam list) =
             if not (List.isEmpty typeParams) then
-                printer.Print("[")
+                printer.Print "["
 
-                let typeParamNames =
-                    typeParams
-                    |> List.map (fun tp ->
-                        match tp with
-                        | TypeVar tv -> tv.Name
-                        | ParamSpec ps -> ps.Name
-                        | TypeVarTuple tvt -> tvt.Name
-                    )
+                for i, tp in List.indexed typeParams do
+                    printer.PrintTypeParam tp
 
-                printer.PrintCommaSeparatedList(typeParamNames)
-                printer.Print("]")
+                    if i < typeParams.Length - 1 then
+                        printer.Print ", "
+
+                printer.Print "]"
 
         member printer.Print(stmt: Statement) =
             match stmt with
@@ -46,6 +57,7 @@ module PrinterExtensions =
             | Raise st -> printer.Print(st)
             | Expr st -> printer.Print(st)
             | With wi -> printer.Print(wi)
+            | Match mt -> printer.Print(mt)
             | For st -> printer.Print(st)
             | Try st -> printer.Print(st)
             | If st -> printer.Print(st)
@@ -94,28 +106,50 @@ module PrinterExtensions =
             printer.Print(kw.Value)
 
         member printer.Print(arguments: Arguments) =
-            if not arguments.PosOnlyArgs.IsEmpty then
-                printer.PrintCommaSeparatedList(arguments.PosOnlyArgs)
-                printer.Print(", /")
-
+            let posonlyargs = arguments.PosOnlyArgs |> List.map AST.Arg
             let args = arguments.Args |> List.map AST.Arg
             let defaults = arguments.Defaults
+            // Defaults apply to the combined positional args (posonlyargs + args)
+            let totalPosArgs = posonlyargs.Length + args.Length
 
+            // Print positional-only args with their defaults
+            for i = 0 to posonlyargs.Length - 1 do
+                printer.Print(posonlyargs.[i])
+
+                if i >= totalPosArgs - defaults.Length then
+                    printer.Print("=")
+                    printer.Print(defaults[i - (totalPosArgs - defaults.Length)])
+
+                if i < posonlyargs.Length - 1 then
+                    printer.Print(", ")
+
+            // Print the / separator if there are positional-only args
+            if not posonlyargs.IsEmpty then
+                if args.IsEmpty then
+                    printer.Print(", /")
+                else
+                    printer.Print(", /, ")
+
+            // Print regular args with their defaults
             for i = 0 to args.Length - 1 do
                 printer.Print(args.[i])
 
-                if i >= args.Length - defaults.Length then
+                let posIndex = posonlyargs.Length + i
+
+                if posIndex >= totalPosArgs - defaults.Length then
                     printer.Print("=")
-                    printer.Print(defaults[i - (args.Length - defaults.Length)])
+                    printer.Print(defaults[posIndex - (totalPosArgs - defaults.Length)])
 
                 if i < args.Length - 1 then
                     printer.Print(", ")
 
-            match arguments.Args, arguments.VarArg with
-            | [], Some vararg ->
+            match arguments.PosOnlyArgs, arguments.Args, arguments.VarArg with
+            | [], [], Some vararg ->
+                // No positional args at all, just print *vararg
                 printer.Print("*")
                 printer.Print(vararg)
-            | _, Some vararg ->
+            | _, _, Some vararg ->
+                // Has positional-only or regular args, need comma before *vararg
                 printer.Print(", *")
                 printer.Print(vararg)
             | _ -> ()
@@ -258,6 +292,112 @@ module PrinterExtensions =
             printer.PrintBlock(ifElse.Body)
             printElse ifElse.Else
 
+        member printer.Print(node: Match) =
+            printer.Print("match ", ?loc = node.Loc)
+            printer.Print(node.Subject)
+            printer.Print(":")
+            printer.PrintNewLine()
+            printer.PushIndentation()
+
+            for case in node.Cases do
+                printer.Print(case)
+
+            printer.PopIndentation()
+
+        member printer.Print(node: MatchCase) =
+            printer.Print("case ")
+            printer.Print(node.Pattern)
+
+            match node.Guard with
+            | Some guard ->
+                printer.Print(" if ")
+                printer.Print(guard)
+            | None -> ()
+
+            printer.Print(":")
+            printer.PrintBlock(node.Body)
+
+        member printer.Print(node: Pattern) =
+            match node with
+            | MatchValue expr -> printer.Print(expr)
+            | MatchSingleton lit ->
+                match lit with
+                | BoolLiteral true -> printer.Print("True")
+                | BoolLiteral false -> printer.Print("False")
+                | NoneLiteral -> printer.Print("None")
+                | _ -> printer.Print(Expression.constant lit)
+            | MatchSequence patterns ->
+                printer.Print("[")
+                printer.PrintCommaSeparatedList(patterns)
+                printer.Print("]")
+            | MatchMapping(keys, patterns, rest) ->
+                printer.Print("{")
+
+                for i, (key, pattern) in List.zip keys patterns |> List.indexed do
+                    printer.Print(key)
+                    printer.Print(": ")
+                    printer.Print(pattern)
+
+                    if i < keys.Length - 1 then
+                        printer.Print(", ")
+
+                match rest with
+                | Some name ->
+                    if not (List.isEmpty keys) then
+                        printer.Print(", ")
+
+                    printer.Print("**")
+                    printer.Print(name)
+                | None -> ()
+
+                printer.Print("}")
+            | MatchClass(cls, patterns, kwdAttrs, kwdPatterns) ->
+                printer.Print(cls)
+                printer.Print("(")
+
+                // Print positional patterns
+                for i, pattern in patterns |> List.indexed do
+                    printer.Print(pattern)
+
+                    if i < patterns.Length - 1 then
+                        printer.Print(", ")
+
+                // Print keyword patterns
+                if not (List.isEmpty kwdAttrs) then
+                    if not (List.isEmpty patterns) then
+                        printer.Print(", ")
+
+                    for i, (attr, pattern) in List.zip kwdAttrs kwdPatterns |> List.indexed do
+                        printer.Print(attr)
+                        printer.Print("=")
+                        printer.Print(pattern)
+
+                        if i < kwdAttrs.Length - 1 then
+                            printer.Print(", ")
+
+                printer.Print(")")
+            | MatchStar name ->
+                printer.Print("*")
+
+                match name with
+                | Some n -> printer.Print(n)
+                | None -> printer.Print("_")
+            | MatchAs(pattern, name) ->
+                match pattern, name with
+                | None, None -> printer.Print("_")
+                | None, Some n -> printer.Print(n)
+                | Some pat, None -> printer.Print(pat)
+                | Some pat, Some n ->
+                    printer.Print(pat)
+                    printer.Print(" as ")
+                    printer.Print(n)
+            | MatchOr patterns ->
+                for i, pattern in patterns |> List.indexed do
+                    printer.Print(pattern)
+
+                    if i < patterns.Length - 1 then
+                        printer.Print(" | ")
+
         member printer.Print(ri: Raise) =
             printer.Print("raise ")
             printer.Print(ri.Exception)
@@ -352,13 +492,14 @@ module PrinterExtensions =
             printer.Print(ta.Value)
 
         member printer.Print(node: Attribute) =
-            printer.Print(node.Value)
+            // Wrap complex expressions (like BinOp) in parens for correct precedence
+            printer.ComplexExpressionWithParens(node.Value)
             printer.Print(".")
             printer.Print(node.Attr)
 
         member printer.Print(ne: NamedExpr) =
             printer.Print(ne.Target)
-            printer.Print(" :=")
+            printer.Print(" := ")
             printer.Print(ne.Value)
 
         member printer.Print(node: Subscript) =
@@ -676,8 +817,22 @@ module PrinterExtensions =
             | Await ex ->
                 printer.Print("await ")
                 printer.Print(ex)
-            | Yield expr -> printer.Print("(Yield)")
-            | YieldFrom expr -> printer.Print("(Yield)")
+            | Yield expr ->
+                printer.Print("yield")
+
+                match expr with
+                | Some e ->
+                    printer.Print(" ")
+                    printer.Print(e)
+                | None -> ()
+            | YieldFrom expr ->
+                printer.Print("yield from")
+
+                match expr with
+                | Some e ->
+                    printer.Print(" ")
+                    printer.Print(e)
+                | None -> ()
             | Compare cp -> printer.Print(cp)
             | Dict di -> printer.Print(di)
             | Tuple tu -> printer.Print(tu)
@@ -810,6 +965,9 @@ module PrinterExtensions =
 
         member printer.PrintCommaSeparatedList(nodes: WithItem list) =
             printer.PrintCommaSeparatedList(nodes |> List.map AST.WithItem)
+
+        member printer.PrintCommaSeparatedList(nodes: Pattern list) =
+            printer.PrintList(nodes, (fun (p: Printer) x -> p.Print(x)), (fun p -> p.Print(", ")))
 
         member printer.PrintFunction
             (

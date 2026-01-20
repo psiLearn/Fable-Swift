@@ -17,14 +17,54 @@ open Fable.Transforms.Python.Reflection
 open Lib
 open Util
 
+/// Wrap an expression in option.erase() to convert Option[T] -> T | None.
+/// This is zero runtime overhead - erase() is an identity function for type checkers.
+let wrapInOptionErase (com: IPythonCompiler) ctx (expr: Expression) =
+    libCall com ctx None "option" "erase" [ expr ]
+
+
+/// Find identifiers used in an expression that have been narrowed in the context
+let findNarrowedIdentsUsedInExpr (ctx: Context) (expr: Fable.Expr) : (string * Fable.Type) list =
+    ctx.NarrowedTypes
+    |> Map.toList
+    |> List.filter (fun (name, _) -> isIdentUsed name expr)
 
 /// Immediately Invoked Function Expression
+/// When narrowed types are in scope, pass them as arguments to avoid closure capture issues
+/// with type narrowing (Pyright can't see that a captured variable has been narrowed)
 let iife (com: IPythonCompiler) ctx (expr: Fable.Expr) =
-    let afe, stmts =
-        Annotation.transformFunctionWithAnnotations com ctx None [] expr
-        |||> makeArrowFunctionExpression com ctx None (Some expr.Type)
+    // Find identifiers that are both used in the expression and have narrowed types
+    let narrowedIdents = findNarrowedIdentsUsedInExpr ctx expr
 
-    Expression.call (afe, []), stmts
+    match narrowedIdents with
+    | [] ->
+        // No narrowed types, use the original approach
+        let args, body, returnType, typeParams =
+            Annotation.transformFunctionWithAnnotations com ctx None [] expr
+
+        let afe, stmts =
+            makeArrowFunctionExpression com ctx None (Some expr.Type) args body returnType typeParams
+
+        Expression.call (afe, []), stmts
+    | narrowedIdents ->
+        // Create Fable.Ident arguments for the narrowed identifiers using makeTypedIdent
+        let fableArgs =
+            narrowedIdents
+            |> List.map (fun (name, narrowedType) -> makeTypedIdent narrowedType name)
+
+        // Transform the function with the narrowed arguments
+        let args, body, returnType, typeParams =
+            Annotation.transformFunctionWithAnnotations com ctx None fableArgs expr
+
+        let afe, stmts =
+            makeArrowFunctionExpression com ctx None (Some expr.Type) args body returnType typeParams
+
+        // Create call arguments from the narrowed identifier names
+        let callArgs =
+            narrowedIdents
+            |> List.map (fun (name, _) -> com.GetIdentifierAsExpr(ctx, Naming.toPythonNaming name))
+
+        Expression.call (afe, callArgs), stmts
 
 let transformImport (com: IPythonCompiler) ctx (_r: SourceLocation option) (name: string) (moduleName: string) =
     let name, parts =
@@ -42,7 +82,6 @@ let getMemberArgsAndBody (com: IPythonCompiler) ctx kind hasSpread (args: Fable.
                 Set.difference (Annotation.getGenericTypeParams [ thisArg.Type ]) ctx.ScopedTypeParams
 
             let body =
-                // TODO: If ident is not captured maybe we can just replace it with "this"
                 if isIdentUsed thisArg.Name body then
                     let thisKeyword = Fable.IdentExpr { thisArg with Name = "self" }
 
@@ -59,19 +98,10 @@ let getMemberArgsAndBody (com: IPythonCompiler) ctx kind hasSpread (args: Fable.
     let ctx =
         { ctx with ScopedTypeParams = Set.union ctx.ScopedTypeParams genTypeParams }
 
-    let args, body, returnType =
+    let args, body, returnType, _typeParams =
         Annotation.transformFunctionWithAnnotations com ctx funcName args body
 
-    let args =
-        let len = args.Args.Length
-
-        if not hasSpread || len = 0 then
-            args
-        else
-            { args with
-                VarArg = Some { args.Args[len - 1] with Annotation = None }
-                Args = args.Args[.. len - 2]
-            }
+    let args = adjustArgsForSpread hasSpread args
 
     args, body, returnType
 
@@ -79,6 +109,29 @@ let getUnionCaseName (uci: Fable.UnionCase) =
     match uci.CompiledName with
     | Some cname -> cname
     | None -> uci.Name
+
+/// Gets the unique case class name by prefixing with the union type name.
+/// This prevents collisions when different union types have cases with the same name.
+/// Library types (Result, Choice) use simple case names without prefix.
+/// The optional entityName parameter should be the compiled entity name (with module scope).
+let getUnionCaseClassName
+    (com: IPythonCompiler)
+    (ent: Fable.Entity)
+    (uci: Fable.UnionCase)
+    (entityName: string option)
+    =
+    let caseName = getUnionCaseName uci
+    // Library types use simple names (Ok, Error, Choice1Of2, etc.) for backwards compatibility
+    if usesSimpleCaseNames ent.FullName then
+        caseName
+    else
+        // Use provided entity name or compute from entity reference
+        let unionName =
+            match entityName with
+            | Some name -> name
+            | None -> FSharp2Fable.Helpers.getEntityDeclarationName com ent.Ref
+
+        $"%s{unionName}_%s{caseName}"
 
 let getUnionExprTag (com: IPythonCompiler) ctx r (fableExpr: Fable.Expr) =
     Expression.withStmts {
@@ -102,6 +155,7 @@ let makeArrowFunctionExpression
     (args: Arguments)
     (body: Statement list)
     returnType
+    (typeParams: TypeParam list)
     : Expression * Statement list
     =
     let isAsync =
@@ -110,11 +164,11 @@ let makeArrowFunctionExpression
         | None -> false
 
     let args =
-        match args.Args with
-        | [] ->
-            let ta = com.GetImportExpr(ctx, "typing", "Any")
+        match args.PosOnlyArgs, args.Args with
+        | [], [] ->
+            let ta = com.GetImportExpr(ctx, getLibPath com "util", "Unit")
 
-            Arguments.arguments (args = [ Arg.arg ("__unit", annotation = ta) ], defaults = [ Expression.none ])
+            Arguments.arguments (args = [ Arg.arg ("__unit", annotation = ta) ], defaults = [ Expression.tuple [] ])
         | _ -> args
 
     let allDefaultsAreNone =
@@ -125,16 +179,18 @@ let makeArrowFunctionExpression
             | _ -> false
         )
 
+    let allArgs = args.PosOnlyArgs @ args.Args
+
     let (|ImmediatelyApplied|_|) =
         function
         | Expression.Call {
                               Func = callee
                               Args = appliedArgs
-                          } when args.Args.Length = appliedArgs.Length && allDefaultsAreNone ->
+                          } when allArgs.Length = appliedArgs.Length && allDefaultsAreNone ->
             // To be sure we're not running side effects when deleting the function check the callee is an identifier
             match callee with
             | Expression.Name _ ->
-                let parameters = args.Args |> List.map (fun a -> (Expression.name a.Arg))
+                let parameters = allArgs |> List.map (fun a -> (Expression.name a.Arg))
 
                 List.zip parameters appliedArgs
                 |> List.forall (
@@ -160,9 +216,9 @@ let makeArrowFunctionExpression
 
         let func =
             if isAsync then
-                createAsyncFunction ident args body [] returnType None
+                createFunctionWithTypeParams ident args body [] returnType None typeParams true
             else
-                createFunction ident args body [] returnType None
+                createFunctionWithTypeParams ident args body [] returnType None typeParams false
 
         Expression.name ident, [ func ]
 
@@ -283,15 +339,17 @@ let optimizeTailCall (com: IPythonCompiler) (ctx: Context) range (tc: ITailCallO
 
 let transformCast (com: IPythonCompiler) (ctx: Context) t e : Expression * Statement list =
     // printfn "transformCast: %A" (t, e)
-    match (t, e) with
+    match t, e with
     | IEnumerableOfKeyValuePair(kvpEnt) ->
-        // Call .items() on the dictionary
+        // Call .items() on the dictionary and wrap with to_enumerable for IEnumerable_1 compatibility
         let dictExpr, stmts = com.TransformAsExpr(ctx, e)
 
         let itemsCall =
             Expression.attribute (value = dictExpr, attr = Identifier "items", ctx = Load)
 
-        Expression.call (itemsCall, []), stmts
+        let itemsExpr = Expression.call (itemsCall, [])
+        // Wrap with to_enumerable to get IEnumerable_1
+        libCall com ctx None "util" "to_enumerable" [ itemsExpr ], stmts
     // Optimization for (numeric) array or list literals casted to seq
     // Done at the very end of the compile pipeline to get more opportunities
     // of matching cast and literal expressions after resolving pipes, inlining...
@@ -304,17 +362,37 @@ let transformCast (com: IPythonCompiler) (ctx: Context) t e : Expression * State
             let xs = Expression.list expr
             libCall com ctx None "util" "to_enumerable" [ xs ], stmts
 
+        // Wrap ResizeArray (Python list) when cast to IEnumerable
+        // Python lists don't implement IEnumerable_1, so they need wrapping
+        // Optimization: If ResizeArray was created via of_seq from IEnumerable, use the original arg
+        | Types.ienumerableGeneric, _ when
+            match e.Type with
+            | Fable.Array(_, Fable.ArrayKind.ResizeArray) -> true
+            | Fable.DeclaredType(entRef, _) when entRef.FullName = Types.resizeArray -> true
+            | _ -> false
+            ->
+            let listExpr, stmts = com.TransformAsExpr(ctx, e)
+            // Check if the expression is of_seq(arg) - if so, use arg directly (already IEnumerable)
+            match listExpr with
+            | Expression.Call {
+                                  Func = Expression.Name { Id = Identifier "of_seq" }
+                                  Args = [ innerArg ]
+                              } ->
+                // Skip both of_seq and to_enumerable - use original IEnumerable directly
+                innerArg, stmts
+            | _ -> libCall com ctx None "util" "to_enumerable" [ listExpr ], stmts
+
         | _ -> com.TransformAsExpr(ctx, e)
     | Fable.Number(Float32, _), _ ->
-        let cons = libValue com ctx "types" "float32"
+        let cons = libValue com ctx "core" "float32"
         let value, stmts = com.TransformAsExpr(ctx, e)
         Expression.call (cons, [ value ], ?loc = None), stmts
     | Fable.Number(Float64, _), _ ->
-        let cons = libValue com ctx "types" "float64"
+        let cons = libValue com ctx "core" "float64"
         let value, stmts = com.TransformAsExpr(ctx, e)
         Expression.call (cons, [ value ], ?loc = None), stmts
     | Fable.Number(Int32, _), _ ->
-        let cons = libValue com ctx "types" "int32"
+        let cons = libValue com ctx "core" "int32"
         let value, stmts = com.TransformAsExpr(ctx, e)
         Expression.call (cons, [ value ], ?loc = None), stmts
     | _ -> com.TransformAsExpr(ctx, e)
@@ -329,7 +407,13 @@ let transformValue (com: IPythonCompiler) (ctx: Context) r value : Expression * 
     | Fable.BaseValue(Some boundIdent, _) -> identAsExpr com ctx boundIdent, []
     | Fable.ThisValue _ -> Expression.identifier "self", []
     | Fable.TypeInfo(t, _) -> transformTypeInfo com ctx r Map.empty t
-    | Fable.Null _t -> Expression.none, []
+    | Fable.Null t ->
+        match t with
+        | Fable.Unit -> Expression.none, []
+        | _ ->
+            // Cast None to the expected type to satisfy the type checker
+            let ta, stmts = Annotation.typeAnnotation com ctx None t
+            wrapNoneInCast com ctx Expression.none ta, stmts
     | Fable.UnitConstant -> undefined r, []
     | Fable.BoolConstant x -> Expression.boolConstant (x, ?loc = r), []
     | Fable.CharConstant x -> Expression.stringConstant (string<char> x, ?loc = r), []
@@ -373,9 +457,9 @@ let transformValue (com: IPythonCompiler) (ctx: Context) r value : Expression * 
         | Fable.NumberValue.Float64 x when x = -infinity -> libValue com ctx "double" "float64.negative_infinity", []
         | Fable.NumberValue.Float64 x when Double.IsNaN(x) -> libValue com ctx "double" "float64.nan", []
         | Fable.NumberValue.Float32 x when Single.IsNaN(x) ->
-            libCall com ctx r "types" "float32" [ Expression.stringConstant "nan" ], []
+            libCall com ctx r "core" "float32" [ Expression.stringConstant "nan" ], []
         | Fable.NumberValue.Float16 x when Single.IsNaN(x) ->
-            libCall com ctx r "types" "float32" [ Expression.stringConstant "nan" ], []
+            libCall com ctx r "core" "float32" [ Expression.stringConstant "nan" ], []
         | Fable.NumberValue.Float16 x -> makeFloat com ctx r value.Type "float32" (float x)
         | Fable.NumberValue.Float32 x -> makeFloat com ctx r value.Type "float32" (float x)
         | Fable.NumberValue.Float64 x -> makeFloat com ctx r value.Type "float64" (float x)
@@ -430,16 +514,42 @@ let transformValue (com: IPythonCompiler) (ctx: Context) r value : Expression * 
             values |> List.map (fun x -> com.TransformAsExpr(ctx, x)) |> Helpers.unzipArgs
 
         List.zip (List.ofArray fieldNames) values |> makePyObject, stmts
-    | Fable.NewUnion(values, tag, ent, _genArgs) ->
-        let ent = com.GetEntity(ent)
+    | Fable.NewUnion(values, tag, entRef, _genArgs) ->
+        let ent = com.GetEntity(entRef)
 
         let values, stmts =
             List.map (fun x -> com.TransformAsExpr(ctx, x)) values |> Helpers.unzipArgs
 
-        let consRef, stmts' = ent |> pyConstructor com ctx
-        // let caseName = ent.UnionCases |> List.item tag |> getUnionCaseName |> ofString
-        let values = ofInt com ctx tag :: values
-        Expression.call (consRef, values, ?loc = r), stmts @ stmts'
+        // Get the union case
+        let uci = ent.UnionCases |> List.item tag
+
+        // Determine the import path based on the entity type
+        let caseRef =
+            // Library types (Result, Choice) use simple case names from fable_library
+            if isLibraryUnionType entRef.FullName then
+                let caseName = getUnionCaseName uci
+                // Result uses "result" module, Choice uses "choice" module
+                let moduleName =
+                    if entRef.FullName = Types.result then
+                        "result"
+                    else
+                        "choice"
+
+                libValue com ctx moduleName caseName
+            else
+                // User-defined union - use full case class name (UnionName_CaseName)
+                let caseClassName = getUnionCaseClassName com ent uci None
+                // Check if it's from another file
+                match entRef.SourcePath with
+                | Some path when path <> com.CurrentFile ->
+                    // Import from another module
+                    let importPath = Path.getRelativeFileOrDirPath false com.CurrentFile false path
+                    com.GetImportExpr(ctx, importPath, caseClassName)
+                | _ ->
+                    // Local - just get identifier
+                    com.GetIdentifierAsExpr(ctx, caseClassName)
+
+        Expression.call (caseRef, values, ?loc = r), stmts
     | _ -> failwith $"transformValue: value %A{value} not supported!"
 
 let extractBaseExprFromBaseCall (com: IPythonCompiler) (ctx: Context) (baseType: Fable.DeclaredType option) baseCall =
@@ -499,9 +609,61 @@ let transformObjectExpr
     // A generic class nested in another generic class cannot use same type variables. (PEP-484)
     let ctx = { ctx with TypeParamsScope = ctx.TypeParamsScope + 1 }
 
-    let makeMethod prop hasSpread args body decorators =
+    // Check if any member body uses ThisValue from an outer scope (e.g., inside a constructor).
+    // ThisValue specifically represents `self` in a constructor/method context.
+    // Note: IsThisArgument identifiers are captured via default arguments (x: Any=x),
+    // so we only need to handle explicit ThisValue here.
+    let usesOuterThis =
+        members
+        |> List.exists (fun memb ->
+            memb.Body
+            |> deepExists (
+                function
+                | Fable.Value(Fable.ThisValue _, _) -> true
+                | _ -> false
+            )
+        )
+
+    // Only generate capture statement if outer this is actually used.
+    // This allows inner class methods to reference the outer instance via "_this"
+    // while using standard "self" for the inner instance (satisfies Pylance).
+    let thisCaptureStmts =
+        if usesOuterThis then
+            let anyType = stdlibModuleAnnotation com ctx "typing" "Any" []
+
+            [
+                Statement.assign (Expression.name "_this", anyType, value = Expression.name "self")
+            ]
+        else
+            []
+
+    // Replace ThisValue in the body with an identifier reference to "_this"
+    // This ensures that outer self references correctly bind to the captured variable
+    let replaceThisValue (body: Fable.Expr) =
+        if usesOuterThis then
+            body
+            |> visitFromInsideOut (
+                function
+                | Fable.Value(Fable.ThisValue typ, r) ->
+                    Fable.IdentExpr
+                        {
+                            Name = "_this"
+                            Type = typ
+                            IsMutable = false
+                            IsThisArgument = false
+                            IsCompilerGenerated = true
+                            Range = r
+                        }
+                | e -> e
+            )
+        else
+            body
+
+    let makeMethod prop hasSpread (fableArgs: Fable.Ident list) (fableBody: Fable.Expr) decorators =
+        let fableBody = replaceThisValue fableBody
+
         let args, body, returnType =
-            getMemberArgsAndBody com ctx (Attached(isStatic = false)) hasSpread args body
+            getMemberArgsAndBody com ctx (Attached(isStatic = false)) hasSpread fableArgs fableBody
 
         let name =
             let name =
@@ -512,37 +674,63 @@ let transformObjectExpr
             com.GetIdentifier(ctx, Naming.toPythonNaming name)
 
         let self = Arg.arg "self"
-
-        let args =
-            match decorators with
-            // Remove extra parameters from getters, i.e __unit=None
-            | [ Expression.Name { Id = Identifier "property" } ] ->
-                { args with
-                    Args = [ self ]
-                    Defaults = []
-                }
-            | _ -> { args with Args = self :: args.Args }
-
-        createFunction name args body decorators returnType None
-
-    /// Transform a callable property (delegate) into a method statement
-    let transformCallableProperty (memb: Fable.ObjectExprMember) (args: Fable.Ident list) (body: Fable.Expr) =
-        // Transform the function directly without treating first arg as 'this'
-        let args, body, returnType =
-            Annotation.transformFunctionWithAnnotations com ctx None args body
-
-        let name = com.GetIdentifier(ctx, Naming.toPythonNaming memb.Name)
-        let self = Arg.arg "self"
         let args = { args with Args = self :: args.Args }
 
-        createFunction name args body [] returnType None
+        // Calculate type parameters for generic object expression methods
+        let argTypes = fableArgs |> List.map _.Type
+
+        let typeParams =
+            Annotation.calculateMethodTypeParams com ctx argTypes fableBody.Type
+
+        createFunctionWithTypeParams name args body decorators returnType None typeParams false
 
     let interfaces, stmts =
         match typ with
         | Fable.Any -> [], [] // Don't inherit from Any
+        | Fable.DeclaredType(entRef, genArgs) ->
+            // Map interface names to ABC base class names for inheritance
+            // Use ABC base classes instead of Protocols for proper method resolution
+            let name = Helpers.removeNamespace entRef.FullName
+            let fullName = entRef.FullName
+
+            // Map interface names to ABC base class(es) using shared helper
+            match Bases.getAbcClassesForInterface name fullName with
+            | Some classes ->
+                let exprs =
+                    classes
+                    |> List.map (fun abcName -> Bases.makeAbcBaseExpr com ctx abcName genArgs)
+
+                exprs, []
+            | None ->
+                // Fall back to regular type annotation for non-mapped interfaces
+                let ta, stmts = Annotation.typeAnnotation com ctx None typ
+                [ ta ], stmts
         | _ ->
             let ta, stmts = Annotation.typeAnnotation com ctx None typ
             [ ta ], stmts
+
+    /// Transform an interface method into a method statement (not a property)
+    let transformInterfaceMethod (memb: Fable.ObjectExprMember) =
+        let args, body =
+            match memb.Body with
+            | Fable.Delegate(args, body, _, _) -> args, body
+            | Fable.Lambda(arg, body, _) -> [ arg ], body
+            | _ -> memb.Args, memb.Body
+
+        // Replace ThisValue with this_ identifier for outer self references
+        let body = replaceThisValue body
+
+        let args', body', returnType =
+            getMemberArgsAndBody com ctx (NonAttached memb.Name) false args body
+
+        let name = com.GetIdentifier(ctx, Naming.toPythonNaming memb.Name)
+        let self = Arg.arg "self"
+        let args' = { args' with Args = self :: args'.Args }
+
+        let argTypes = args |> List.map _.Type
+        let typeParams = Annotation.calculateMethodTypeParams com ctx argTypes body.Type
+
+        createFunctionWithTypeParams name args' body' [] returnType None typeParams false
 
     let members =
         members
@@ -550,29 +738,14 @@ let transformObjectExpr
             let info = com.GetMember(memb.MemberRef)
 
             if not memb.IsMangled && (info.IsGetter || info.IsValue) then
-                match memb.Body with
-                | Fable.Delegate(args, body, _, _) ->
-                    // Transform callable property into method
-                    [ transformCallableProperty memb args body ]
-                | _ ->
-                    // Regular property
+                if Bases.isInterfaceMethod com typ memb.Name then
+                    [ transformInterfaceMethod memb ]
+                else
                     let decorators = [ Expression.name "property" ]
                     [ makeMethod memb.Name false memb.Args memb.Body decorators ]
             elif not memb.IsMangled && info.IsSetter then
                 let decorators = [ Expression.name $"%s{memb.Name}.setter" ]
-
                 [ makeMethod memb.Name false memb.Args memb.Body decorators ]
-            elif info.FullName = "System.Collections.Generic.IEnumerable.GetEnumerator" then
-                let method = makeMethod memb.Name info.HasSpread memb.Args memb.Body []
-
-                let iterator =
-                    let body = enumerator2iterator com ctx
-                    let name = com.GetIdentifier(ctx, "__iter__")
-                    let args = Arguments.arguments [ Arg.arg "self" ]
-
-                    Statement.functionDef (name = name, args = args, body = body)
-
-                [ method; iterator ]
             else
                 [ makeMethod memb.Name info.HasSpread memb.Args memb.Body [] ]
         )
@@ -598,7 +771,7 @@ let transformObjectExpr
 
     let stmt = Statement.classDef (name, body = classBody, bases = interfaces)
 
-    Expression.call (Expression.name name), [ stmt ] @ stmts
+    Expression.call (Expression.name name), thisCaptureStmts @ [ stmt ] @ stmts
 
 
 let transformCallArgs
@@ -698,6 +871,16 @@ let transformCallArgs
     let hasSpread =
         paramsInfo |> Option.map (fun i -> i.HasSpread) |> Option.defaultValue false
 
+    // Helper to transform an arg and wrap with widen() if needed
+    let transformArgWithWiden (sigType: Fable.Type option) (argExpr: Fable.Expr) =
+        let expr, stmts = com.TransformAsExpr(ctx, argExpr)
+
+        if needsOptionWidenForArg sigType argExpr then
+            let widen = com.TransformImport(ctx, "widen", getLibPath com "option")
+            Expression.call (widen, [ expr ]), stmts
+        else
+            expr, stmts
+
     let args, stmts' =
         match args with
         | [] -> [], []
@@ -707,7 +890,7 @@ let transformCallArgs
             | Replacements.Util.ArrayOrListLiteral(spreadArgs, _) :: rest ->
                 let rest = List.rev rest |> List.map (fun e -> com.TransformAsExpr(ctx, e))
 
-                rest @ (List.map (fun e -> com.TransformAsExpr(ctx, e)) spreadArgs)
+                rest @ List.map (fun e -> com.TransformAsExpr(ctx, e)) spreadArgs
                 |> Helpers.unzipArgs
             | last :: rest ->
                 let rest, stmts =
@@ -717,7 +900,14 @@ let transformCallArgs
 
                 let expr, stmts' = com.TransformAsExpr(ctx, last)
                 rest @ [ Expression.starred expr ], stmts @ stmts'
-        | args -> List.map (fun e -> com.TransformAsExpr(ctx, e)) args |> Helpers.unzipArgs
+        | args ->
+            // Transform args with widen() where needed based on signature types
+            args
+            |> List.mapi (fun i e ->
+                let sigType = List.tryItem i callInfo.SignatureArgTypes
+                transformArgWithWiden sigType e
+            )
+            |> Helpers.unzipArgs
 
     match objArg with
     | None -> args, [], stmts @ stmts'
@@ -730,7 +920,7 @@ let resolveExpr (ctx: Context) _t strategy pyExpr : Statement list =
     | Some ReturnUnit -> exprAsStatement ctx pyExpr
     // TODO: Where to put these int wrappings? Add them also for function arguments?
     | Some(ResourceManager strategy) -> resolveExpr ctx _t strategy pyExpr
-    | Some Return -> [ Statement.return' pyExpr ]
+    | Some(Return _) -> [ Statement.return' pyExpr ]
     | Some(Assign left) -> exprAsStatement ctx (assign None left pyExpr)
     | Some(Target left) -> exprAsStatement ctx (assign None (left |> Expression.identifier) pyExpr)
 
@@ -817,15 +1007,15 @@ let transformOperation com ctx range opKind tags : Expression * Statement list =
 
 let transformEmit (com: IPythonCompiler) ctx range (info: Fable.EmitInfo) =
     let macro = info.Macro
-    let info = info.CallInfo
+    let callInfo = info.CallInfo
 
     let thisArg, stmts =
-        info.ThisArg
+        callInfo.ThisArg
         |> Option.map (fun e -> com.TransformAsExpr(ctx, e))
         |> Option.toList
         |> Helpers.unzipArgs
 
-    let exprs, kw, stmts' = transformCallArgs com ctx info false
+    let exprs, kw, stmts' = transformCallArgs com ctx callInfo false
 
     if macro.StartsWith("functools", StringComparison.Ordinal) then
         com.GetImportExpr(ctx, "functools") |> ignore
@@ -863,37 +1053,63 @@ let transformEmit (com: IPythonCompiler) ctx range (info: Fable.EmitInfo) =
                 // For other emit patterns with keywords, fallback to emit (might lose keywords)
                 emitExpression range macro args, stmts @ stmts'
 
+/// Unwrap to_enumerable from a Python expression if present
+/// make_dict can handle Python iterables directly, so we can skip the wrapper
+let unwrapToEnumerable (expr: Expression) =
+    match expr with
+    | Expression.Call {
+                          Func = Expression.Name { Id = Identifier "to_enumerable" }
+                          Args = [ innerArg ]
+                      } -> innerArg
+    | _ -> expr
+
 let transformCall (com: IPythonCompiler) ctx range callee (callInfo: Fable.CallInfo) : Expression * Statement list =
     // printfn "transformCall: %A" (callee, callInfo)
-    let callee', stmts = com.TransformAsExpr(ctx, callee)
 
-    let args, kw, stmts' = transformCallArgs com ctx callInfo false
+    // Optimization: Unwrap to_enumerable for make_dict calls since make_dict can handle Python iterables directly
+    match callee with
+    | Fable.Import({
+                       Selector = "make_dict"
+                       Kind = Fable.LibraryImport _
+                   },
+                   _,
+                   _) ->
+        let callee', stmts = com.TransformAsExpr(ctx, callee)
+        let args, kw, stmts' = transformCallArgs com ctx callInfo false
+        // Unwrap to_enumerable from the argument if present
+        let args = args |> List.map unwrapToEnumerable
+        callFunction range callee' args kw, stmts @ stmts'
+    | _ ->
 
-    match callee, callInfo.ThisArg with
-    | Fable.Get(expr, Fable.FieldGet { Name = "Dispose" }, _, _), _ ->
-        let expr, stmts'' = com.TransformAsExpr(ctx, expr)
+        let callee', stmts = com.TransformAsExpr(ctx, callee)
 
-        libCall com ctx range "util" "dispose" [ expr ], stmts @ stmts' @ stmts''
-    | Fable.Get(expr, Fable.FieldGet { Name = "set" }, _, _), _ ->
-        // printfn "Type: %A" expr.Type
-        Expression.withStmts {
-            let! right = com.TransformAsExpr(ctx, callInfo.Args.Head)
-            let! arg = com.TransformAsExpr(ctx, callInfo.Args.Tail.Head)
-            let! value = com.TransformAsExpr(ctx, expr)
-            return! Expression.none, [ Statement.assign ([ Expression.subscript (value, right) ], arg) ]
-        }
-    | Fable.Get(_, Fable.FieldGet { Name = "sort" }, _, _), _ -> callFunction range callee' [] kw, stmts @ stmts'
+        let args, kw, stmts' = transformCallArgs com ctx callInfo false
 
-    | _, Some(TransformExpr com ctx (thisArg, stmts'')) ->
-        callFunction range callee' (thisArg :: args) kw, stmts @ stmts' @ stmts''
-    | _, None when List.contains "new" callInfo.Tags ->
-        Expression.call (callee', args, kw, ?loc = range), stmts @ stmts'
-    | _, None -> callFunction range callee' args kw, stmts @ stmts'
+        match callee, callInfo.ThisArg with
+        | Fable.Get(expr, Fable.FieldGet { Name = "Dispose" }, _, _), _ ->
+            let expr, stmts'' = com.TransformAsExpr(ctx, expr)
+
+            libCall com ctx range "util" "dispose" [ expr ], stmts @ stmts' @ stmts''
+        | Fable.Get(expr, Fable.FieldGet { Name = "set" }, _, _), _ ->
+            // printfn "Type: %A" expr.Type
+            Expression.withStmts {
+                let! right = com.TransformAsExpr(ctx, callInfo.Args.Head)
+                let! arg = com.TransformAsExpr(ctx, callInfo.Args.Tail.Head)
+                let! value = com.TransformAsExpr(ctx, expr)
+                return! Expression.none, [ Statement.assign ([ Expression.subscript (value, right) ], arg) ]
+            }
+        | Fable.Get(_, Fable.FieldGet { Name = "sort" }, _, _), _ -> callFunction range callee' [] kw, stmts @ stmts'
+
+        | _, Some(TransformExpr com ctx (thisArg, stmts'')) ->
+            callFunction range callee' (thisArg :: args) kw, stmts @ stmts' @ stmts''
+        | _, None when List.contains "new" callInfo.Tags ->
+            Expression.call (callee', args, kw, ?loc = range), stmts @ stmts'
+        | _, None -> callFunction range callee' args kw, stmts @ stmts'
 
 let transformCurriedApply com ctx range (TransformExpr com ctx (applied, stmts)) args =
     ((applied, stmts), args)
     ||> List.fold (fun (applied, stmts) arg ->
-        let args, stmts' =
+        let args, argStmts =
             match arg with
             // TODO: If arg type is unit but it's an expression with potential
             // side-effects, we need to extract it and execute it before the call
@@ -901,10 +1117,27 @@ let transformCurriedApply com ctx range (TransformExpr com ctx (applied, stmts))
             // TODO: discardUnitArg may still be needed in some cases
             | Fable.Value(Fable.UnitConstant, _) -> [], []
             | Fable.IdentExpr ident when ident.Type = Fable.Unit -> [], []
-            | TransformExpr com ctx (arg, stmts') -> [ arg ], stmts'
+            | arg ->
+                let argExpr, transformStmts = com.TransformAsExpr(ctx, arg)
+                // When a Call or CurriedApply result is passed as an argument,
+                // check if we need to erase Option[T] to T | None
+                let argExpr =
+                    if needsOptionEraseForBinding arg arg.Type then
+                        wrapInOptionErase com ctx argExpr
+                    else
+                        argExpr
 
-        callFunction range applied args [], stmts @ stmts'
+                [ argExpr ], transformStmts
+
+        callFunction range applied args [], stmts @ argStmts
     )
+
+/// Extract the expected return type from a return strategy, unwrapping ResourceManager if needed
+let rec private getExpectedReturnType (strategy: ReturnStrategy option) =
+    match strategy with
+    | Some(Return(Some expectedType)) -> Some expectedType
+    | Some(ResourceManager inner) -> getExpectedReturnType inner
+    | _ -> None
 
 let transformCallAsStatements com ctx range t returnStrategy callee callInfo =
     let argsLen (i: Fable.CallInfo) =
@@ -915,7 +1148,7 @@ let transformCallAsStatements com ctx range t returnStrategy callee callInfo =
                0)
     // Warn when there's a recursive call that couldn't be optimized?
     match returnStrategy, ctx.TailCallOpportunity with
-    | Some(Return | ReturnUnit), Some tc when tc.IsRecursiveRef(callee) && argsLen callInfo = List.length tc.Args ->
+    | Some(Return _ | ReturnUnit), Some tc when tc.IsRecursiveRef(callee) && argsLen callInfo = List.length tc.Args ->
         let args =
             match callInfo.ThisArg with
             | Some thisArg -> thisArg :: callInfo.Args
@@ -924,12 +1157,26 @@ let transformCallAsStatements com ctx range t returnStrategy callee callInfo =
         optimizeTailCall com ctx range tc args
     | _ ->
         let expr, stmts = transformCall com ctx range callee callInfo
+        // Check if we need to cast Option[T] to T | None for return statements
+        // Also handles ResourceManager-wrapped return strategies (e.g., inside `with` blocks)
+        let expr =
+            match getExpectedReturnType returnStrategy with
+            | Some expectedType ->
+                // Create a temporary Fable.Call to check if erase is needed
+                let callExpr = Fable.Call(callee, callInfo, t, range)
+
+                if needsOptionEraseForReturn callExpr expectedType then
+                    wrapInOptionErase com ctx expr
+                else
+                    expr
+            | None -> expr
+
         stmts @ (expr |> resolveExpr ctx t returnStrategy)
 
 let transformCurriedApplyAsStatements com ctx range t returnStrategy callee args =
     // Warn when there's a recursive call that couldn't be optimized?
     match returnStrategy, ctx.TailCallOpportunity with
-    | Some(Return | ReturnUnit), Some tc when tc.IsRecursiveRef(callee) && List.sameLength args tc.Args ->
+    | Some(Return _ | ReturnUnit), Some tc when tc.IsRecursiveRef(callee) && List.sameLength args tc.Args ->
         optimizeTailCall com ctx range tc args
     | _ ->
         let expr, stmts = transformCurriedApply com ctx range callee args
@@ -1005,10 +1252,10 @@ let transformTryCatch com (ctx: Context) r returnStrategy (body, catch: option<F
 
             match extractedHandlers with
             | [] ->
-                // No type tests found, use BaseException to catch all exceptions including
-                // KeyboardInterrupt, SystemExit, GeneratorExit which don't inherit from Exception
-                let handler =
-                    makeHandler (Expression.identifier "BaseException") catchBody identifier
+                // No type tests found, use Exception to match F#/.NET semantics.
+                // Users can explicitly catch KeyboardInterrupt, SystemExit, GeneratorExit
+                // using type tests if needed.
+                let handler = makeHandler (Expression.identifier "Exception") catchBody identifier
 
                 Some [ handler ], []
 
@@ -1025,11 +1272,11 @@ let transformTryCatch com (ctx: Context) r returnStrategy (body, catch: option<F
                     |> List.unzip
 
                 // Add fallback handler if fallback is not just a reraise
-                // Use BaseException to catch all exceptions including KeyboardInterrupt etc.
+                // Use Exception to match F#/.NET semantics
                 let fallbackHandlers =
                     match fallback with
                     | Some fallbackExpr when not (ExceptionHandling.isReraise fallbackExpr) ->
-                        [ makeHandler (Expression.identifier "BaseException") fallbackExpr identifier ]
+                        [ makeHandler (Expression.identifier "Exception") fallbackExpr identifier ]
                     | _ -> []
 
                 Some(handlers @ fallbackHandlers), List.concat stmts
@@ -1068,7 +1315,17 @@ let makeCastStatement (com: IPythonCompiler) ctx (ident: Fable.Ident) (typ: Fabl
         | Fable.List _ -> true
         | _ -> false
 
-    if hasGenerics then
+    // Check if the original type already has the same generic arguments
+    // If so, Pyright can infer the narrowed type and the cast is unnecessary
+    let originalGenArgs = Annotation.getGenericArgs ident.Type
+    let targetGenArgs = Annotation.getGenericArgs typ
+
+    let sameGenericArgs =
+        not (List.isEmpty originalGenArgs)
+        && not (List.isEmpty targetGenArgs)
+        && originalGenArgs = targetGenArgs
+
+    if hasGenerics && not sameGenericArgs then
         let cast = com.GetImportExpr(ctx, "typing", "cast")
         let varExpr = identAsExpr com ctx ident
         let typeAnnotation, importStmts = Annotation.typeAnnotation com ctx None typ
@@ -1079,14 +1336,8 @@ let makeCastStatement (com: IPythonCompiler) ctx (ident: Fable.Ident) (typ: Fabl
         []
 
 let rec transformIfStatement (com: IPythonCompiler) ctx r ret guardExpr thenStmnt elseStmnt =
-    // printfn "transformIfStatement"
-
-    // Create refined context for then branch if guard is a type test
-    let thenCtx =
-        match guardExpr with
-        | Fable.Test(Fable.IdentExpr ident, Fable.TypeTest typ, _) ->
-            { ctx with NarrowedTypes = Map.add ident.Name typ ctx.NarrowedTypes }
-        | _ -> ctx
+    // Create refined context for then/else branches based on guard type
+    let thenCtx, elseCtx = getNarrowedContexts ctx guardExpr
 
     let expr, stmts = com.TransformAsExpr(ctx, guardExpr)
 
@@ -1121,7 +1372,7 @@ let rec transformIfStatement (com: IPythonCompiler) ctx r ret guardExpr thenStmn
 
         let ifStatement, stmts'' =
             let block, stmts =
-                transformBlock com ctx ret elseStmnt
+                transformBlock com elseCtx ret elseStmnt
                 |> List.partition (
                     function
                     | Statement.NonLocal _
@@ -1193,16 +1444,21 @@ let transformGet (com: IPythonCompiler) ctx range typ (fableExpr: Fable.Expr) ki
         // TODO: Check the erased expressions don't have side effects?
         | Fable.Value(Fable.NewTuple(exprs, _), _) -> com.TransformAsExpr(ctx, List.item index exprs)
         | TransformExpr com ctx (expr, stmts) ->
-            let expr, stmts' = getExpr com ctx range expr (ofInt com ctx index)
+            let expr, stmts' = getExpr com ctx range expr (Expression.intConstant index)
             expr, stmts @ stmts'
 
     | Fable.OptionValue ->
         let expr, stmts = com.TransformAsExpr(ctx, fableExpr)
 
-        if mustWrapOption typ || com.Options.Language = TypeScript then
+        if mustWrapOption typ then
             libCall com ctx range "option" "value" [ expr ], stmts
         else
-            expr, stmts
+            // For concrete types, Python erases Option[T] to T | None.
+            // Use option.value() when the expression is a function call (not narrowable by Pyright)
+            // but skip it for idents (Pyright can narrow via isinstance/is not None checks)
+            match fableExpr with
+            | Fable.IdentExpr _ -> expr, stmts
+            | _ -> libCall com ctx range "option" "value" [ expr ], stmts
 
     | Fable.UnionTag ->
         let expr, stmts = getUnionExprTag com ctx range fableExpr
@@ -1212,7 +1468,7 @@ let transformGet (com: IPythonCompiler) ctx range typ (fableExpr: Fable.Expr) ki
         Expression.withStmts {
             let! baseExpr = com.TransformAsExpr(ctx, fableExpr)
             let! fieldsExpr = getExpr com ctx range baseExpr (Expression.stringConstant "fields")
-            let! finalExpr = getExpr com ctx range fieldsExpr (ofInt com ctx i.FieldIndex)
+            let! finalExpr = getExpr com ctx range fieldsExpr (Expression.intConstant i.FieldIndex)
             return finalExpr
         }
 
@@ -1249,8 +1505,10 @@ let transformBindingExprBody (com: IPythonCompiler) (ctx: Context) (var: Fable.I
     | Function(args, body) ->
         let name = Some var.Name
 
-        Annotation.transformFunctionWithAnnotations com ctx name args body
-        |||> makeArrowFunctionExpression com ctx name (Some body.Type)
+        let args', body', returnType, typeParams =
+            Annotation.transformFunctionWithAnnotations com ctx name args body
+
+        makeArrowFunctionExpression com ctx name (Some body.Type) args' body' returnType typeParams
     | _ ->
         let expr, stmt = com.TransformAsExpr(ctx, value)
         expr |> wrapIntExpression value.Type, stmt
@@ -1261,25 +1519,49 @@ let transformBindingAsExpr (com: IPythonCompiler) ctx (var: Fable.Ident) (value:
     expr |> assign None (identAsExpr com ctx var), stmts
 
 let transformBindingAsStatements (com: IPythonCompiler) ctx (var: Fable.Ident) (value: Fable.Expr) =
-    // printfn "transformBindingAsStatements: %A" (var, value)
     let shouldTreatAsStatement = isPyStatement ctx false value
+    let needsErase = needsOptionEraseForBinding value var.Type
+    // Skip type annotation to avoid Option[T] vs T | None mismatch issues with Pyright:
+    // 1. When extracting from invariant containers (Array, List) with Options
+    // 2. When assigning from a wrapped option after None check (narrowing issue)
+    let skipAnnotation =
+        valueExtractsFromInvariantContainer value var.Type
+        || isWrappedOptionNarrowingAssignment value
 
     if shouldTreatAsStatement then
         let varName, varExpr = Expression.name var.Name, identAsExpr com ctx var
 
         ctx.BoundVars.Bind(var.Name)
-        let ta, stmts = Annotation.typeAnnotation com ctx None var.Type
-        let decl = Statement.assign (varName, ta)
 
-        let body = com.TransformAsStatements(ctx, Some(Assign varExpr), value)
-
-        stmts @ [ decl ] @ body
+        if skipAnnotation then
+            // No type annotation - let Python infer from function return type
+            let body = com.TransformAsStatements(ctx, Some(Assign varExpr), value)
+            body
+        else
+            let ta, stmts = Annotation.typeAnnotation com ctx None var.Type
+            let decl = Statement.assign (varName, ta)
+            let body = com.TransformAsStatements(ctx, Some(Assign varExpr), value)
+            stmts @ [ decl ] @ body
     else
-        let value, stmts = transformBindingExprBody com ctx var value
+        let expr, stmts = transformBindingExprBody com ctx var value
         let varName = com.GetIdentifierAsExpr(ctx, Naming.toPythonNaming var.Name)
-        let ta, stmts' = Annotation.typeAnnotation com ctx None var.Type
-        let decl = varDeclaration ctx varName (Some ta) value
-        stmts @ stmts' @ decl
+
+        if skipAnnotation then
+            // No type annotation - let Python infer from function return type
+            let decl = varDeclaration ctx varName None expr
+            stmts @ decl
+        else
+            let ta, stmts' = Annotation.typeAnnotation com ctx None var.Type
+            // Erase Option wrapper if needed (zero runtime overhead, just for type checker)
+            let expr' =
+                if needsErase then
+                    wrapInOptionErase com ctx expr
+                else
+                    expr
+
+            let value' = wrapNoneInCast com ctx expr' ta
+            let decl = varDeclaration ctx varName (Some ta) value'
+            stmts @ stmts' @ decl
 
 let transformTest (com: IPythonCompiler) ctx range kind expr : Expression * Statement list =
     match kind with
@@ -1333,7 +1615,7 @@ let transformSwitch (com: IPythonCompiler) ctx _useBlocks returnStrategy evalExp
 
                 let caseBody =
                     match returnStrategy with
-                    | Some Return -> caseBody
+                    | Some(Return _) -> caseBody
                     | _ -> List.append caseBody [ Statement.break' () ]
 
                 let expr, stmts = com.TransformAsExpr(ctx, lastGuard)
@@ -1380,10 +1662,7 @@ let transformSwitch (com: IPythonCompiler) ctx _useBlocks returnStrategy evalExp
                             | Statement.Break -> false
                             | _ -> true
                         )
-                        |> function
-                            // Make sure we don't have an empty body
-                            | [] -> [ Statement.Pass ]
-                            | body -> body
+                        |> Util.ensureNonEmptyBody
 
                     let nonLocals, body = getNonLocals ctx body
 
@@ -1414,7 +1693,12 @@ let getDecisionTargetAndBoundValues (com: IPythonCompiler) (ctx: Context) target
         let bindings, replacements =
             (([], Map.empty), identsAndValues)
             ||> List.fold (fun (bindings, replacements) (ident, expr) ->
-                if canHaveSideEffects com expr then
+                // Only inline if the expression has no side effects AND is referenced at most once.
+                // If referenced multiple times, we should bind to a variable to avoid duplicating
+                // the expression (which can cause issues like accessing properties on literals).
+                let refCount = FableTransforms.countReferencesUntil 2 ident.Name target
+
+                if canHaveSideEffects com expr || refCount > 1 then
                     (ident, expr) :: bindings, replacements
                 else
                     bindings, Map.add ident.Name expr replacements
@@ -1495,11 +1779,19 @@ let transformDecisionTreeSuccessAsStatements
 let transformDecisionTreeAsSwitch expr =
     let (|Equals|_|) =
         function
-        | Fable.Operation(Fable.Binary(BinaryEqual, expr, right), _, _, _) ->
-            match expr with
+        | Fable.Operation(Fable.Binary(BinaryEqual, left, right), _, _, _) ->
+            // Return (evalExpr, caseExpr) where evalExpr is the thing being matched (identifier)
+            // and caseExpr is the constant value
+            // Try constant on right side first (more common: x == 1)
+            match right with
             | Fable.Value((Fable.CharConstant _ | Fable.StringConstant _ | Fable.NumberConstant _), _) ->
-                Some(expr, right)
-            | _ -> None
+                Some(left, right) // left is identifier, right is constant
+            | _ ->
+                // Try constant on left side (less common: 1 == x)
+                match left with
+                | Fable.Value((Fable.CharConstant _ | Fable.StringConstant _ | Fable.NumberConstant _), _) ->
+                    Some(right, left) // right is identifier, left is constant
+                | _ -> None
         | Fable.Test(expr, Fable.UnionCaseTest tag, _) ->
             let evalExpr =
                 Fable.Get(expr, Fable.UnionTag, Fable.Number(Int32, Fable.NumberInfo.Empty), None)
@@ -1524,7 +1816,6 @@ let transformDecisionTreeAsSwitch expr =
             match treeExpr with
             | Fable.DecisionTreeSuccess(defaultTargetIndex, defaultBoundValues, _) ->
                 let cases = (caseExpr, targetIndex, boundValues) :: cases |> List.rev
-
                 Some(evalExpr, cases, (defaultTargetIndex, defaultBoundValues))
             | treeExpr -> checkInner ((caseExpr, targetIndex, boundValues) :: cases) evalExpr treeExpr
         | _ -> None
@@ -1535,6 +1826,417 @@ let transformDecisionTreeAsSwitch expr =
         | Some(evalExpr, cases, defaultCase) -> Some(evalExpr, cases, defaultCase)
         | None -> None
     | _ -> None
+
+// Re-export from Util for local use
+let fableValueToPattern = MatchStatements.fableValueToPattern
+
+/// Transforms bound values into binding statements by zipping idents with values.
+/// Returns empty list if lengths don't match (defensive).
+let private transformBindings com ctx (idents: Fable.Ident list) (boundValues: Fable.Expr list) =
+    if List.length idents = List.length boundValues then
+        List.zip idents boundValues
+        |> List.collect (fun (ident, value) -> transformBindingAsStatements com ctx ident value)
+    else
+        []
+
+/// Builds a default (wildcard) match case for the given target index.
+let private buildDefaultMatchCase
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    defaultIndex
+    =
+    let _idents, targetExpr = targets |> List.item defaultIndex
+    let body = com.TransformAsStatements(ctx, returnStrategy, targetExpr)
+    MatchCase.matchCase (Pattern.matchWildcard (), body)
+
+/// Transforms a single guard case (debug mode) into a Python MatchCase with guard expression.
+/// Returns None if the guard contains statements (not expressible as a Python guard).
+let private transformDebugModeGuardCase
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (subjectName: string)
+    (_subj, param, guardBody, targetIndex, _boundValues)
+    =
+    let idents, targetExpr = targets.[targetIndex]
+
+    // Use the target's bound identifier for the pattern if available
+    let patternIdent =
+        match idents with
+        | [ ident ] -> ident
+        | _ -> param
+
+    // Substitute param references with patternIdent in guard body if needed
+    let guardBody' =
+        if param.Name <> patternIdent.Name then
+            FableTransforms.replaceValues (Map.ofList [ param.Name, Fable.IdentExpr patternIdent ]) guardBody
+        else
+            guardBody
+
+    let guard, guardStmts = com.TransformAsExpr(ctx, guardBody')
+
+    // Guards with statements cannot be expressed in Python match
+    if not (List.isEmpty guardStmts) then
+        None
+    else
+        let name = com.GetIdentifier(ctx, patternIdent.Name)
+        let pattern = MatchAs(None, Some name)
+
+        let targetExpr' =
+            MatchStatements.unwrapRedundantLets subjectName patternIdent targetExpr
+
+        let body = com.TransformAsStatements(ctx, returnStrategy, targetExpr')
+        Some(MatchCase.matchCase (pattern, body, guard))
+
+/// Transforms a single inlined guard case (release mode) into a Python MatchCase with guard expression.
+/// In release mode, guards are inlined directly as comparison operations.
+/// Returns None if the guard contains statements (not expressible as a Python guard).
+let private transformReleaseModeGuardCase
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (subjectIdent: Fable.Ident)
+    (guardCondition: Fable.Expr, targetIndex: int, _boundValues: Fable.Expr list)
+    =
+    let idents, targetExpr = targets.[targetIndex]
+
+    // Use the target's bound identifier for the pattern if available
+    let patternIdent =
+        match idents with
+        | [ ident ] -> ident
+        | _ -> subjectIdent
+
+    // Transform the guard condition
+    let guard, guardStmts = com.TransformAsExpr(ctx, guardCondition)
+
+    // Guards with statements cannot be expressed in Python match
+    if not (List.isEmpty guardStmts) then
+        None
+    else
+        let name = com.GetIdentifier(ctx, patternIdent.Name)
+        let pattern = MatchAs(None, Some name)
+
+        let targetExpr' =
+            MatchStatements.unwrapRedundantLets subjectIdent.Name patternIdent targetExpr
+
+        let body = com.TransformAsStatements(ctx, returnStrategy, targetExpr')
+        Some(MatchCase.matchCase (pattern, body, guard))
+
+/// Transforms debug mode guard pattern cases into a Python match statement.
+let private transformDebugModeGuardPatternAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (subjectIdent: Fable.Ident)
+    guardCases
+    (defaultIndex, _defaultBoundValues)
+    =
+    let ctx = { ctx with DecisionTargets = targets }
+
+    let matchCases =
+        guardCases
+        |> List.map (transformDebugModeGuardCase com ctx returnStrategy targets subjectIdent.Name)
+
+    // All cases must convert successfully
+    if matchCases |> List.exists Option.isNone then
+        None
+    else
+        let matchCases = matchCases |> List.choose id
+        let defaultCase = buildDefaultMatchCase com ctx returnStrategy targets defaultIndex
+        let allCases = matchCases @ [ defaultCase ]
+        let subjectExpr, stmts = com.TransformAsExpr(ctx, Fable.IdentExpr subjectIdent)
+        let matchStmt = Statement.match' (subjectExpr, allCases)
+        Some(stmts @ [ matchStmt ])
+
+/// Transforms release mode (inlined) guard pattern cases into a Python match statement.
+let private transformReleaseModeGuardPatternAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (subjectIdent: Fable.Ident)
+    (guardCases: MatchStatements.InlinedGuardCase list)
+    (defaultIndex, _defaultBoundValues)
+    =
+    let ctx = { ctx with DecisionTargets = targets }
+
+    let matchCases =
+        guardCases
+        |> List.map (transformReleaseModeGuardCase com ctx returnStrategy targets subjectIdent)
+
+    // All cases must convert successfully
+    if matchCases |> List.exists Option.isNone then
+        None
+    else
+        let matchCases = matchCases |> List.choose id
+        let defaultCase = buildDefaultMatchCase com ctx returnStrategy targets defaultIndex
+        let allCases = matchCases @ [ defaultCase ]
+        let subjectExpr, stmts = com.TransformAsExpr(ctx, Fable.IdentExpr subjectIdent)
+        let matchStmt = Statement.match' (subjectExpr, allCases)
+        Some(stmts @ [ matchStmt ])
+
+/// Transforms switch-like pattern cases into a Python match statement.
+let private transformSwitchPatternAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    evalExpr
+    cases
+    (defaultIndex, _defaultBoundValues)
+    =
+    // Check if all cases have empty bound values (simple value matching)
+    let allSimpleValueCases =
+        cases |> List.forall (fun (_, _, boundValues) -> List.isEmpty boundValues)
+
+    if not allSimpleValueCases then
+        None
+    else
+        // Try to convert all case expressions to patterns
+        let convertedCases =
+            cases
+            |> List.choose (fun (caseExpr, targetIndex, _boundValues) ->
+                match fableValueToPattern caseExpr with
+                | Some pattern -> Some(pattern, targetIndex)
+                | None -> None
+            )
+
+        // Check if all cases were successfully converted
+        if List.length convertedCases <> List.length cases then
+            None
+        else
+            let ctx = { ctx with DecisionTargets = targets }
+
+            // Group cases by target index to create or-patterns
+            let groupedCases =
+                convertedCases
+                |> List.groupBy snd
+                |> List.map (fun (targetIndex, patterns) ->
+                    let patterns = patterns |> List.map fst
+
+                    let pattern =
+                        match patterns with
+                        | [ single ] -> single
+                        | multiple -> MatchOr multiple
+
+                    (pattern, targetIndex)
+                )
+
+            // Build match cases
+            let matchCases =
+                groupedCases
+                |> List.map (fun (pattern, targetIndex) ->
+                    let _idents, targetExpr = targets.[targetIndex]
+                    let body = com.TransformAsStatements(ctx, returnStrategy, targetExpr)
+                    MatchCase.matchCase (pattern, body)
+                )
+
+            // Build default case (wildcard)
+            let defaultCase = buildDefaultMatchCase com ctx returnStrategy targets defaultIndex
+
+            // Check if the default case is already covered by the grouped cases
+            let defaultAlreadyCovered =
+                groupedCases |> List.exists (fun (_, idx) -> idx = defaultIndex)
+
+            let allCases =
+                if defaultAlreadyCovered then
+                    matchCases
+                else
+                    matchCases @ [ defaultCase ]
+
+            // Transform the evaluation expression
+            let subject, stmts = com.TransformAsExpr(ctx, evalExpr)
+
+            // Build the match statement
+            let matchStmt = Statement.match' (subject, allCases)
+
+            Some(stmts @ [ matchStmt ])
+
+/// Transforms a tuple Option pattern into a Python match statement.
+/// Generates: match (x, y): case (None, _): ... case (_, None): ... case _: ...
+let private transformTupleOptionPatternAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (result: MatchStatements.TupleOptionPatternResult)
+    : Statement list option
+    =
+    let ctx = { ctx with DecisionTargets = targets }
+
+    // Build the tuple subject expression
+    let subjectExprs, subjectStmts =
+        result.TestedVars
+        |> List.map (fun ident -> com.TransformAsExpr(ctx, Fable.IdentExpr ident))
+        |> List.unzip
+
+    let subjectStmts = List.concat subjectStmts
+    let subject = Expression.tuple subjectExprs
+
+    // Build None cases: case (None, _), case (_, None), etc.
+    let noneCases =
+        result.TestedVars
+        |> List.mapi (fun i _ ->
+            // Create pattern like (_, None, _) where None is at position i
+            let patterns =
+                result.TestedVars
+                |> List.mapi (fun j _ ->
+                    if i = j then
+                        MatchSingleton NoneLiteral
+                    else
+                        Pattern.matchWildcard ()
+                )
+
+            let pattern = MatchSequence patterns
+
+            // Get the None target body
+            let _, noneExpr = targets.[result.NoneTargetIndex]
+            let noneBody = com.TransformAsStatements(ctx, returnStrategy, noneExpr)
+            MatchCase.matchCase (pattern, Util.ensureNonEmptyBody noneBody)
+        )
+
+    // Build success case (wildcard - all are Some)
+    // Need to bind the extracted values before executing the target body
+    let successIdents, successExpr = targets.[result.SuccessTargetIndex]
+    let bindingStmts = transformBindings com ctx successIdents result.SuccessBoundValues
+    let successBodyStmts = com.TransformAsStatements(ctx, returnStrategy, successExpr)
+    let successBody = Util.ensureNonEmptyBody (bindingStmts @ successBodyStmts)
+    let successCase = MatchCase.matchCase (Pattern.matchWildcard (), successBody)
+
+    // Combine all cases
+    let allCases = noneCases @ [ successCase ]
+    let matchStmt = Statement.match' (subject, allCases)
+
+    Some(subjectStmts @ [ matchStmt ])
+
+/// Transform a tuple boolean+guard pattern into a Python match statement.
+/// Handles patterns like: match tuple with | true, _, i when i > -1 -> ... | _ -> ...
+/// Generates: match tuple: case [True, _, i] if i > threshold: ... case _: ...
+let private transformTupleBoolGuardPatternAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (result: MatchStatements.TupleBoolGuardPatternResult)
+    : Statement list option
+    =
+    let ctx = { ctx with DecisionTargets = targets }
+
+    // Get tuple arity from the type
+    let tupleArity =
+        match result.TupleType with
+        | Fable.Tuple(types, _) -> List.length types
+        | _ -> 3 // Default to 3 if we can't determine
+
+    // Transform the tuple expression
+    let tupleExpr, tupleStmts = com.TransformAsExpr(ctx, result.TupleExpr)
+
+    // Helper to replace tuple[idx] with a captured variable in an expression
+    let replaceGuardTupleAccess (guardIdx: int) (varName: string) (expr: Fable.Expr) : Fable.Expr =
+        let rec replace expr =
+            match expr with
+            | Fable.Get(tupleExpr', Fable.TupleIndex idx, typ, _) when idx = guardIdx ->
+                match tupleExpr', result.TupleExpr with
+                | Fable.IdentExpr id1, Fable.IdentExpr id2 when id1.Name = id2.Name ->
+                    makeTypedIdent typ varName |> Fable.IdentExpr
+                | _ -> expr
+            | Fable.Operation(Fable.Binary(op, left, right), tags, typ, range) ->
+                Fable.Operation(Fable.Binary(op, replace left, replace right), tags, typ, range)
+            | _ -> expr
+
+        replace expr
+
+    // Transform each guard case into a match case
+    let transformCase (caseIdx: int) (case: MatchStatements.TupleBoolGuardCase) : MatchCase option =
+        match case.GuardIndex, case.GuardExpr with
+        | Some guardIdx, Some guardExpr ->
+            // Generate unique variable name for this case
+            let guardVarName = getUniqueNameInDeclarationScope ctx $"i_%d{caseIdx}"
+            let guardVarIdent = Identifier guardVarName
+
+            // Build pattern: [True, _, captured_var] or similar
+            let patterns =
+                [ 0 .. tupleArity - 1 ]
+                |> List.map (fun i ->
+                    if i = result.BoolIndex then
+                        MatchSingleton(BoolLiteral result.BoolValue)
+                    elif i = guardIdx then
+                        MatchAs(None, Some guardVarIdent)
+                    else
+                        Pattern.matchWildcard ()
+                )
+
+            let pattern = MatchSequence patterns
+
+            // Transform guard, replacing tuple access with captured variable
+            let guardExpr' = replaceGuardTupleAccess guardIdx guardVarName guardExpr
+            let guard, guardStmts = com.TransformAsExpr(ctx, guardExpr')
+
+            if not (List.isEmpty guardStmts) then
+                None // Guard has statements, can't convert
+            else
+                // Transform target body
+                let targetIdents, targetExpr = targets.[case.TargetIndex]
+                let bindingStmts = transformBindings com ctx targetIdents case.BoundValues
+                let bodyStmts = com.TransformAsStatements(ctx, returnStrategy, targetExpr)
+                let body = Util.ensureNonEmptyBody (bindingStmts @ bodyStmts)
+                Some(MatchCase.matchCase (pattern, body, guard))
+        | _ -> None
+
+    // Try to transform all cases
+    let matchCases = result.Cases |> List.mapi transformCase |> List.choose id
+
+    // Check if all cases converted successfully
+    if List.length matchCases <> List.length result.Cases then
+        None
+    else
+        // Transform default target body
+        let defaultIdents, defaultExpr = targets.[result.DefaultTargetIndex]
+
+        let defaultBindingStmts =
+            transformBindings com ctx defaultIdents result.DefaultBoundValues
+
+        let defaultBodyStmts = com.TransformAsStatements(ctx, returnStrategy, defaultExpr)
+        let defaultBody = Util.ensureNonEmptyBody (defaultBindingStmts @ defaultBodyStmts)
+        let defaultCase = MatchCase.matchCase (Pattern.matchWildcard (), defaultBody)
+        let matchStmt = Statement.match' (tupleExpr, matchCases @ [ defaultCase ])
+        Some(tupleStmts @ [ matchStmt ])
+
+/// Transform a decision tree into a Python match statement.
+/// Returns None if the pattern is too complex for match statement conversion.
+let transformDecisionTreeAsMatch
+    (com: IPythonCompiler)
+    (ctx: Context)
+    returnStrategy
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (treeExpr: Fable.Expr)
+    : Statement list option
+    =
+    // First try switch-like patterns (constant matching)
+    match transformDecisionTreeAsSwitch treeExpr with
+    | Some(evalExpr, cases, defaultCase) ->
+        transformSwitchPatternAsMatch com ctx returnStrategy targets evalExpr cases defaultCase
+    | None ->
+        // Try guard pattern matching (e.g., | n when n > 10 -> ...)
+        match MatchStatements.tryExtractGuardPattern treeExpr with
+        | Some(MatchStatements.DebugModeGuards(subjectIdent, guardCases, defaultCase)) ->
+            transformDebugModeGuardPatternAsMatch com ctx returnStrategy targets subjectIdent guardCases defaultCase
+        | Some(MatchStatements.ReleaseModeGuards(subjectIdent, guardCases, defaultCase)) ->
+            transformReleaseModeGuardPatternAsMatch com ctx returnStrategy targets subjectIdent guardCases defaultCase
+        | None ->
+            // Try tuple Option pattern: match (x, y) with | Some a, Some b -> ... | _ -> None
+            match MatchStatements.tryExtractTupleOptionPattern treeExpr with
+            | Some result -> transformTupleOptionPatternAsMatch com ctx returnStrategy targets result
+            | None ->
+                // Try tuple boolean+guard pattern: match tuple with | true, _, i when i > -1 -> ...
+                match MatchStatements.tryExtractTupleBoolGuardPattern treeExpr with
+                | Some result -> transformTupleBoolGuardPatternAsMatch com ctx returnStrategy targets result
+                | None -> None
 
 let transformDecisionTreeAsExpr (com: IPythonCompiler) (ctx: Context) targets expr : Expression * Statement list =
     // TODO: Check if some targets are referenced multiple times
@@ -1602,23 +2304,64 @@ let transformDecisionTreeWithTwoSwitches
     (targets: (Fable.Ident list * Fable.Expr) list)
     treeExpr
     =
+    // Use the "two switches" pattern: first switch determines target index and binds values,
+    // second switch executes the actual target code.
     // Declare target and bound idents
     let targetId =
         getUniqueNameInDeclarationScope ctx "pattern_matching_result" |> makeIdent
 
+    // Collect all bound idents - these are initialized to None
+    let boundIdents =
+        targets
+        |> List.collect (fun (idents, _) -> idents)
+        |> List.distinctBy (fun id -> id.Name)
+
+    // Generate: (pattern_matching_result, v1, v2, ...) = nullable[int32, T1, T2, ...]()
+    // This tells Pyright the types while allowing initial None values
+    let nullableFunc = libValue com ctx "util" "nullable"
+
+    // Collect type annotations and any prerequisite statements
+    let int32Type = Fable.Number(Int32, Fable.NumberInfo.Empty)
+
+    let allTypes = int32Type :: (boundIdents |> List.map (fun id -> id.Type))
+
+    let typeAnnotations, typeStmts =
+        allTypes
+        |> List.map (fun t -> Annotation.typeAnnotation com ctx None t)
+        |> List.unzip
+
+    // Build nullable[T1, T2, ...]()
+    let typeSubscript =
+        match typeAnnotations with
+        | [ single ] -> single
+        | multiple -> Expression.tuple multiple
+
+    let nullableCall =
+        Expression.call (Expression.subscript (nullableFunc, typeSubscript), [])
+
+    // Build the tuple of target names for unpacking: (pattern_matching_result, v1, v2) = nullable[...]()
+    let allIdents =
+        (ident com ctx targetId) :: (boundIdents |> List.map (ident com ctx))
+
+    let targetNames = allIdents |> List.map Expression.name
+    // Wrap in a tuple to get tuple unpacking (a, b, c) = ... instead of chained a = b = c = ...
+    let targetTuple = Expression.tuple targetNames
+
     let multiVarDecl =
-        let boundIdents =
-            targets
-            |> List.collect (fun (idents, _) -> idents)
-            |> List.map (fun id -> ident com ctx id, None)
+        (typeStmts |> List.concat)
+        @ [ Statement.assign ([ targetTuple ], nullableCall) ]
 
-        multiVarDeclaration ctx ((ident com ctx targetId, None) :: boundIdents)
-    // Transform targets as switch
     let switch2 =
-        // TODO: Declare the last case as the default case?
-        let cases = targets |> List.mapi (fun i (_, target) -> [ makeIntConst i ], target)
+        // Make the last case a default case to ensure exhaustive matching
+        // This fixes type errors where pyright thinks not all paths return a value
+        let allCases =
+            targets |> List.mapi (fun i (_, target) -> [ makeIntConst i ], target)
 
-        transformSwitch com ctx true returnStrategy (targetId |> Fable.IdentExpr) cases None
+        match List.tryLast allCases with
+        | Some(_, lastTarget) when allCases.Length > 1 ->
+            let cases = allCases |> List.take (allCases.Length - 1)
+            transformSwitch com ctx true returnStrategy (targetId |> Fable.IdentExpr) cases (Some lastTarget)
+        | _ -> transformSwitch com ctx true returnStrategy (targetId |> Fable.IdentExpr) allCases None
 
     // Transform decision tree
     let targetAssign = Target(ident com ctx targetId)
@@ -1659,22 +2402,27 @@ let transformDecisionTreeAsStatements
 
     match targetsWithMultiRefs with
     | [] ->
-        let ctx = { ctx with DecisionTargets = targets }
+        // Try to transform as a Python match statement first (Python 3.10+)
+        match transformDecisionTreeAsMatch com ctx returnStrategy targets treeExpr with
+        | Some matchStmts -> matchStmts
+        | None ->
+            // Fall back to if/elif/else transformation
+            let ctx = { ctx with DecisionTargets = targets }
 
-        match transformDecisionTreeAsSwitch treeExpr with
-        | Some(evalExpr, cases, (defaultIndex, defaultBoundValues)) ->
-            let t = treeExpr.Type
+            match transformDecisionTreeAsSwitch treeExpr with
+            | Some(evalExpr, cases, (defaultIndex, defaultBoundValues)) ->
+                let t = treeExpr.Type
 
-            let cases =
-                cases
-                |> List.map (fun (caseExpr, targetIndex, boundValues) ->
-                    [ caseExpr ], Fable.DecisionTreeSuccess(targetIndex, boundValues, t)
-                )
+                let cases =
+                    cases
+                    |> List.map (fun (caseExpr, targetIndex, boundValues) ->
+                        [ caseExpr ], Fable.DecisionTreeSuccess(targetIndex, boundValues, t)
+                    )
 
-            let defaultCase = Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, t)
+                let defaultCase = Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, t)
 
-            transformSwitch com ctx true returnStrategy evalExpr cases (Some defaultCase)
-        | None -> com.TransformAsStatements(ctx, returnStrategy, treeExpr)
+                transformSwitch com ctx true returnStrategy evalExpr cases (Some defaultCase)
+            | None -> com.TransformAsStatements(ctx, returnStrategy, treeExpr)
     | targetsWithMultiRefs ->
         // If the bound idents are not referenced in the target, remove them
         let targets =
@@ -1692,18 +2440,23 @@ let transformDecisionTreeAsStatements
             |> List.exists (fun idx -> targets[idx] |> fst |> List.isEmpty |> not)
 
         if not hasAnyTargetWithMultiRefsBoundValues then
-            match transformDecisionTreeAsSwitch treeExpr with
-            | Some(evalExpr, cases, (defaultIndex, defaultBoundValues)) ->
-                let t = treeExpr.Type
+            // Try to transform as a Python match statement first (supports or-patterns)
+            match transformDecisionTreeAsMatch com ctx returnStrategy targets treeExpr with
+            | Some matchStmts -> matchStmts
+            | None ->
+                // Fall back to if/elif/else transformation
+                match transformDecisionTreeAsSwitch treeExpr with
+                | Some(evalExpr, cases, (defaultIndex, defaultBoundValues)) ->
+                    let t = treeExpr.Type
 
-                let cases = groupSwitchCases t cases (defaultIndex, defaultBoundValues)
+                    let cases = groupSwitchCases t cases (defaultIndex, defaultBoundValues)
 
-                let ctx = { ctx with DecisionTargets = targets }
+                    let ctx = { ctx with DecisionTargets = targets }
 
-                let defaultCase = Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, t)
+                    let defaultCase = Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, t)
 
-                transformSwitch com ctx true returnStrategy evalExpr cases (Some defaultCase)
-            | None -> transformDecisionTreeWithTwoSwitches com ctx returnStrategy targets treeExpr
+                    transformSwitch com ctx true returnStrategy evalExpr cases (Some defaultCase)
+                | None -> transformDecisionTreeWithTwoSwitches com ctx returnStrategy targets treeExpr
         else
             transformDecisionTreeWithTwoSwitches com ctx returnStrategy targets treeExpr
 
@@ -1779,12 +2532,16 @@ let rec transformAsExpr (com: IPythonCompiler) ctx (expr: Fable.Expr) : Expressi
     | Fable.Test(expr, kind, range) -> transformTest com ctx range kind expr
 
     | Fable.Lambda(arg, body, name) ->
-        Annotation.transformFunctionWithAnnotations com ctx name [ arg ] body
-        |||> makeArrowFunctionExpression com ctx name (Some body.Type)
+        let args', body', returnType, typeParams =
+            Annotation.transformFunctionWithAnnotations com ctx name [ arg ] body
+
+        makeArrowFunctionExpression com ctx name (Some body.Type) args' body' returnType typeParams
 
     | Fable.Delegate(args, body, name, _) ->
-        Annotation.transformFunctionWithAnnotations com ctx name args body
-        |||> makeArrowFunctionExpression com ctx name (Some body.Type)
+        let args', body', returnType, typeParams =
+            Annotation.transformFunctionWithAnnotations com ctx name args body
+
+        makeArrowFunctionExpression com ctx name (Some body.Type) args' body' returnType typeParams
 
     | Fable.ObjectExpr([], typ, None) ->
         // Check if the type is an interface
@@ -1833,22 +2590,25 @@ let rec transformAsExpr (com: IPythonCompiler) ctx (expr: Fable.Expr) : Expressi
 
     | Fable.Get(expr, kind, typ, range) -> transformGet com ctx range typ expr kind
 
-    | Fable.IfThenElse(Fable.Test(expr, Fable.TypeTest typ, r), thenExpr, TransformExpr com ctx (elseExpr, stmts''), _r) ->
+    // Handle TypeTest and OptionTest for type narrowing
+    | Fable.IfThenElse(Fable.Test(expr, testKind, r), thenExpr, elseExpr, _r) when
+        (match testKind with
+         | Fable.TypeTest _
+         | Fable.OptionTest _ -> true
+         | _ -> false)
+        ->
+        let guardExpr = Fable.Test(expr, testKind, r)
+        let thenCtx, elseCtx = getNarrowedContexts ctx guardExpr
+
         let finalExpr, stmts =
             Expression.withStmts {
-                let! guardExpr = transformTest com ctx r (Fable.TypeTest typ) expr
-
-                // Create refined context for then branch with type assertion
-                let thenCtx =
-                    match expr with
-                    | Fable.IdentExpr ident -> { ctx with NarrowedTypes = Map.add ident.Name typ ctx.NarrowedTypes }
-                    | _ -> ctx
-
+                let! guardExprCompiled = transformTest com ctx r testKind expr
                 let! thenExprCompiled = com.TransformAsExpr(thenCtx, thenExpr)
-                return Expression.ifExp (guardExpr, thenExprCompiled, elseExpr)
+                let! elseExprCompiled = com.TransformAsExpr(elseCtx, elseExpr)
+                return Expression.ifExp (guardExprCompiled, thenExprCompiled, elseExprCompiled)
             }
 
-        finalExpr, stmts @ stmts''
+        finalExpr, stmts
 
     | Fable.IfThenElse(TransformExpr com ctx (guardExpr, stmts),
                        TransformExpr com ctx (thenExpr, stmts'),
@@ -1994,7 +2754,8 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
 
     | Fable.IdentExpr id ->
         let narrowedType = getNarrowedType ctx id
-        identAsExpr com ctx id |> resolveExpr ctx narrowedType returnStrategy
+        let expr = identAsExpr com ctx id
+        expr |> resolveExpr ctx narrowedType returnStrategy
 
     | Fable.Import({
                        Selector = selector
@@ -2010,16 +2771,20 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
         stmts @ (expr |> resolveExpr ctx Fable.Boolean returnStrategy)
 
     | Fable.Lambda(arg, body, name) ->
-        let expr', stmts =
+        let args', body', returnType, typeParams =
             transformFunctionWithAnnotations com ctx name [ arg ] body
-            |||> makeArrowFunctionExpression com ctx name (Some body.Type)
+
+        let expr', stmts =
+            makeArrowFunctionExpression com ctx name (Some body.Type) args' body' returnType typeParams
 
         stmts @ (expr' |> resolveExpr ctx expr.Type returnStrategy)
 
     | Fable.Delegate(args, body, name, _) ->
-        let expr', stmts =
+        let args', body', returnType, typeParams =
             transformFunctionWithAnnotations com ctx name args body
-            |||> makeArrowFunctionExpression com ctx name (Some body.Type)
+
+        let expr', stmts =
+            makeArrowFunctionExpression com ctx name (Some body.Type) args' body' returnType typeParams
 
         stmts @ (expr' |> resolveExpr ctx expr.Type returnStrategy)
 
@@ -2056,12 +2821,19 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
         stmts @ (expr |> resolveExpr ctx t returnStrategy)
 
     // Transform F# `use` i.e TryCatch as Python `with`
+    // We wrap the value in Disposable(...) to provide context manager support
+    // for IDisposable objects that don't have __enter__/__exit__ methods
     | Fable.Let(ident, value, UsePattern(disposeName, tryBody)) when ident.Name = disposeName ->
         let id = Identifier ident.Name
         let body = transformBlock com ctx (Some(ResourceManager returnStrategy)) tryBody
 
         let value, stmts = com.TransformAsExpr(ctx, value)
-        let items = [ WithItem.withItem (value, Expression.name id) ]
+
+        // Wrap value in Disposable(...) to provide context manager support
+        let disposable = libValue com ctx "util" "Disposable"
+        let wrappedValue = Expression.call (disposable, [ value ])
+
+        let items = [ WithItem.withItem (wrappedValue, Expression.name id) ]
         stmts @ [ Statement.with' (items, body) ]
 
     | Fable.Let(ident, value, body) ->
@@ -2086,20 +2858,32 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
                                    Value = value
                                    Loc = _
                                }) ->
-            let nonLocals, ta =
+            let nonLocals, ta, taForCast =
                 match target with
                 | Expression.Name { Id = id } ->
                     let nonLocals = [ ctx.BoundVars.NonLocals([ id ]) |> Statement.nonLocal ]
 
-                    nonLocals, None
+                    nonLocals, None, None
                 | Expression.Attribute { Value = Expression.Name { Id = Identifier "self" } } ->
+                    // Uncurry field types to match runtime behavior (class fields store uncurried functions)
+                    let uncurriedType = FableTransforms.uncurryType typ
+                    let ta, stmts = Annotation.typeAnnotation com ctx None uncurriedType
+                    stmts, Some ta, Some ta
+                | Expression.Attribute _ ->
+                    // For non-self attribute assignments, we still need the type for casting None
                     let ta, stmts = Annotation.typeAnnotation com ctx None typ
-                    stmts, Some ta
-                | _ -> [], None
+                    stmts, None, Some ta
+                | _ -> [], None, None
 
             let assignment =
-                match ta with
-                | Some ta -> [ Statement.assign (target, ta, value) ]
+                match ta, taForCast with
+                | Some ta, _ ->
+                    let value' = wrapNoneInCast com ctx value ta
+                    [ Statement.assign (target, ta, value') ]
+                | None, Some ta ->
+                    // No type annotation on assignment, but still wrap None in cast
+                    let value' = wrapNoneInCast com ctx value ta
+                    [ Statement.assign ([ target ], value') ]
                 | _ -> [ Statement.assign ([ target ], value) ]
 
             nonLocals @ stmts @ assignment
@@ -2111,6 +2895,28 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
         // Rewrite `if (guard) { Debugger; null }` to assert (guard)
         let guardExpr', stmts = transformAsExpr com ctx guardExpr
         stmts @ [ Statement.assert' guardExpr' ]
+    // Two-case union pattern: if shape.tag == 0 then ... else ...
+    // Transform to: match shape.tag: case 0: ... case _: ...
+    | Fable.IfThenElse(Fable.Test(unionExpr, Fable.UnionCaseTest tag, _), thenExpr, elseExpr, _r) ->
+        let tagExpr =
+            Fable.Get(unionExpr, Fable.UnionTag, Fable.Number(Int32, Fable.NumberInfo.Empty), None)
+
+        let subject, subjectStmts = com.TransformAsExpr(ctx, tagExpr)
+
+        let thenBody =
+            com.TransformAsStatements(ctx, returnStrategy, thenExpr)
+            |> Util.ensureNonEmptyBody
+
+        let elseBody =
+            com.TransformAsStatements(ctx, returnStrategy, elseExpr)
+            |> Util.ensureNonEmptyBody
+
+        let tagPattern = MatchValue(Expression.intConstant tag)
+        let wildcardPattern = Pattern.matchWildcard ()
+        let thenCase = MatchCase.matchCase (tagPattern, thenBody)
+        let elseCase = MatchCase.matchCase (wildcardPattern, elseBody)
+        let matchStmt = Statement.match' (subject, [ thenCase; elseCase ])
+        subjectStmts @ [ matchStmt ]
     | Fable.IfThenElse(guardExpr, thenExpr, elseExpr, r) ->
         let asStatement =
             match returnStrategy with
@@ -2119,7 +2925,7 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
             | Some(Target _) -> true // Compile as statement so values can be bound
             | Some(Assign _) -> (isPyStatement ctx false thenExpr) || (isPyStatement ctx false elseExpr)
             | Some(ResourceManager _) -> true
-            | Some Return ->
+            | Some(Return _) ->
                 Option.isSome ctx.TailCallOpportunity
                 || (isPyStatement ctx false thenExpr)
                 || (isPyStatement ctx false elseExpr)
@@ -2127,18 +2933,14 @@ let rec transformAsStatements (com: IPythonCompiler) ctx returnStrategy (expr: F
         if asStatement then
             transformIfStatement com ctx r returnStrategy guardExpr thenExpr elseExpr
         else
-            // Create refined context for then branch if guard is a type test
-            let thenCtx =
-                match guardExpr with
-                | Fable.Test(Fable.IdentExpr ident, Fable.TypeTest typ, _) ->
-                    { ctx with NarrowedTypes = Map.add ident.Name typ ctx.NarrowedTypes }
-                | _ -> ctx
+            // Create refined context for then/else branches based on guard type
+            let thenCtx, elseCtx = getNarrowedContexts ctx guardExpr
 
             let expr, stmts =
                 Expression.withStmts {
                     let! guardExpr' = transformAsExpr com ctx guardExpr
-                    let! thenExpr' = transformAsExpr com thenCtx thenExpr // Use refined context
-                    let! elseExpr' = transformAsExpr com ctx elseExpr
+                    let! thenExpr' = transformAsExpr com thenCtx thenExpr
+                    let! elseExpr' = transformAsExpr com elseCtx elseExpr
                     return Expression.ifExp (guardExpr', thenExpr', elseExpr', ?loc = r)
                 }
 
@@ -2262,15 +3064,26 @@ let transformFunction
         if body.Type = Fable.Unit then
             transformBlock com ctx (Some ReturnUnit) body
         elif isPyStatement ctx (Option.isSome tailcallChance) body then
-            transformBlock com ctx (Some Return) body
+            transformBlock com ctx (Some(Return(Some body.Type))) body
         else
-            transformAsExpr com ctx body |> wrapExprInBlockWithReturn
+            let expr, stmts = transformAsExpr com ctx body
+            // Check if we need to erase Option[T] to T | None for return expressions
+            let expr =
+                if needsOptionEraseForReturn body body.Type then
+                    wrapInOptionErase com ctx expr
+                else
+                    expr
 
-    let isUnit =
+            stmts @ [ Statement.return' expr ]
+
+    // Check if the last argument is unit or generic param (could be unit)
+    // This determines if a single-arg function should have a default value
+    let isUnitOrGeneric =
         List.tryLast args
-        |> Option.map (
-            function
-            | { Type = Fable.GenericParam _ } -> true
+        |> Option.map (fun arg ->
+            match arg.Type with
+            | Fable.GenericParam _
+            | Fable.Unit -> true
             | _ -> false
         )
         |> Option.defaultValue false
@@ -2302,13 +3115,14 @@ let transformFunction
 
             args', [], Statement.while' (Expression.boolConstant true, body) |> List.singleton
         | _ ->
-            // Make sure all unit arguments get default values of None
+            // Make sure unit and Option arguments get default values of None
+            // Option defaults support F# optional parameters (?x) which have Option type
             let defaults =
                 args
                 |> List.map (fun arg ->
                     match arg.Type with
-                    | Fable.Unit -> Some Expression.none
                     | Fable.Any
+                    | Fable.Unit
                     | Fable.Option _ -> Some Expression.none
                     | _ -> None
                 )
@@ -2332,22 +3146,23 @@ let transformFunction
             args', finalDefaults, body
 
     let arguments =
-        match args, isUnit with
-        | [], _ ->
+        let unitDefault = libValue com ctx "util" "UNIT"
+
+        match args, isUnitOrGeneric, tcArgs with
+        // No args and no tail-call args: add __unit parameter
+        | [], _, [] ->
+            let unitType = com.GetImportExpr(ctx, getLibPath com "util", "Unit")
+
             Arguments.arguments (
-                args = Arg.arg (Identifier("__unit"), annotation = Expression.name "None") :: tcArgs,
-                defaults = Expression.none :: tcDefaults
+                args = [ Arg.arg (Identifier("__unit"), annotation = unitType) ],
+                defaults = [ unitDefault ]
             )
-        // So we can also receive unit
-        | [ arg ], true ->
-            let optional =
-                match arg.Annotation with
-                | Some typeArg -> Expression.binOp (typeArg, BitOr, Expression.name "None") |> Some
-                | None -> None
-
-            let args = [ { arg with Annotation = optional } ]
-
-            Arguments.arguments (args @ tcArgs, defaults = Expression.none :: tcDefaults)
+        // No args but has tail-call args: skip __unit, tcArgs are sufficient
+        | [], _, _ -> Arguments.arguments (args = tcArgs, defaults = tcDefaults)
+        // Single generic/unit arg with no tail-call args: keep it with () default
+        | [ arg ], true, [] -> Arguments.arguments (args = args, defaults = [ unitDefault ])
+        // Single generic/unit arg with tail-call args: keep arg (body may reference it)
+        | [ arg ], true, _ -> Arguments.arguments (args @ tcArgs, defaults = unitDefault :: tcDefaults)
         | _ -> Arguments.arguments (args @ tcArgs, defaults = defaults @ tcDefaults)
 
     arguments, body
@@ -2413,9 +3228,15 @@ let getEntityFieldsAsProps (com: IPythonCompiler) ctx (ent: Fable.Entity) =
     if ent.IsFSharpUnion then
         getUnionFieldsAsIdents com ctx ent |> Array.map (identAsExpr com ctx)
     else
+        let namingConvention =
+            if shouldUseRecordFieldNaming ent then
+                Naming.toRecordFieldSnakeCase
+            else
+                Naming.toPythonNaming
+
         ent.FSharpFields
         |> Seq.map (fun field ->
-            let name = field.Name |> Naming.toPythonNaming
+            let name = field.Name |> namingConvention
 
             let cleanName =
                 (name, Naming.NoMemberPart) ||> Naming.sanitizeIdent Naming.pyBuiltins.Contains
@@ -2438,20 +3259,74 @@ let declareDataClassType
     =
     let name = com.GetIdentifier(ctx, entName)
 
+    // Generate field annotations from entity's FSharpFields to properly uncurry function types.
+    // Record/dataclass fields store functions uncurried at runtime, so we need to uncurry
+    // lambda types in the type annotations to match.
     let props =
-        consArgs.Args
-        |> List.map (fun arg ->
-            let any _ =
-                stdlibModuleAnnotation com ctx "typing" "Any" []
+        ent.FSharpFields
+        |> List.mapi (fun i field ->
+            // Get the argument name from consArgs (preserves the Python naming convention)
+            let argName =
+                if i < consArgs.Args.Length then
+                    consArgs.Args.[i].Arg
+                else
+                    // Fallback to field name if consArgs doesn't have enough args
+                    com.GetIdentifier(ctx, field.Name |> Naming.toRecordFieldSnakeCase |> Helpers.clean)
 
-            let annotation = arg.Annotation |> Option.defaultWith any
+            // Uncurry lambda types for field annotations since fields store uncurried functions
+            let fieldType =
+                match field.FieldType with
+                | Fable.LambdaType _ -> FableTransforms.uncurryType field.FieldType
+                | _ -> field.FieldType
 
-            Statement.assign (Expression.name arg.Arg, annotation = annotation)
+            let annotation, _ = Annotation.typeAnnotation com ctx None fieldType
+
+            Statement.assign (Expression.name argName, annotation = annotation)
         )
 
 
     let typeParams = makeEntityTypeParams com ctx ent
-    let bases = baseExpr |> Option.toList
+
+    // For record types (dataclasses), the Record base class already provides:
+    // - StringableBase (__str__, __repr__ from ToString)
+    // - EquatableBase (__eq__, __ne__ from Equals)
+    // - ComparableBase (__lt__, __le__, __gt__, __ge__ from CompareTo)
+    //
+    // We only need to add EnumerableBase for IEnumerable interfaces (for iteration support)
+    let allowedInterfaces = [ "IEnumerable_1" ]
+
+    let interfaceBases =
+        ent.AllInterfaces
+        |> List.ofSeq
+        |> List.filter (fun int ->
+            let name = Helpers.removeNamespace (int.Entity.FullName)
+            allowedInterfaces |> List.contains name
+        )
+        |> List.map (fun int ->
+            // Filter out self-referential generic arguments to avoid forward reference errors
+            let genericArgs =
+                int.GenericArgs
+                |> List.filter (fun genArg ->
+                    match genArg with
+                    | Fable.DeclaredType({ FullName = fullName }, _) -> Helpers.removeNamespace (fullName) <> entName
+                    | _ -> true
+                )
+
+            // Generate the EnumerableBase reference from bases module
+            if List.isEmpty genericArgs then
+                libValue com ctx "bases" "EnumerableBase"
+            else
+                let typeArgs =
+                    genericArgs
+                    |> List.map (fun genArg ->
+                        let arg, _ = Annotation.typeAnnotation com ctx None genArg
+                        arg
+                    )
+
+                Expression.subscript (libValue com ctx "bases" "EnumerableBase", Expression.tuple typeArgs)
+        )
+
+    let bases = (baseExpr |> Option.toList) @ interfaceBases
 
     // Add a __hash__ method to the class
     let hashMethod =
@@ -2559,6 +3434,23 @@ let transformClassAttributes
         |> List.ofSeq
     | _ -> []
 
+/// Generate class-level annotations for static fields.
+/// This is needed because static let bindings in F# are compiled to a static constructor
+/// that assigns to class attributes, but Python type checkers (Pylance/Pyright) require
+/// class-level declarations for these attributes to be recognized (per PEP 526).
+let generateStaticFieldAnnotations (com: IPythonCompiler) (ctx: Context) (ent: Fable.Entity) : Statement list =
+    ent.FSharpFields
+    |> List.choose (fun field ->
+        // Filter out compiler-generated fields (e.g., "init@110-1" from tuple patterns)
+        // which contain special characters not valid in Python identifiers
+        if field.IsStatic && not (field.Name.Contains("@")) then
+            let fieldName = field.Name |> Naming.toPythonNaming
+            let ta, _ = Annotation.typeAnnotation com ctx None field.FieldType
+            Some(Statement.annAssign (Expression.name fieldName, annotation = ta))
+        else
+            None
+    )
+
 let declareClassType
     (com: IPythonCompiler)
     (ctx: Context)
@@ -2591,6 +3483,9 @@ let declareClassType
 
     let classFields = slotMembers // TODO: annotations
 
+    // Generate class-level annotations for static fields (e.g., from static let bindings)
+    let staticFieldAnnotations = generateStaticFieldAnnotations com ctx ent
+
     // Generate class attributes if using attributes style
     let classAttributes =
         transformClassAttributes com ctx ent classAttributes extractedInitialValues
@@ -2598,7 +3493,13 @@ let declareClassType
     let classMembers = classCons @ classMembers
 
     let classBody =
-        let body = [ yield! classFields; yield! classAttributes; yield! classMembers ]
+        let body =
+            [
+                yield! classFields
+                yield! staticFieldAnnotations
+                yield! classAttributes
+                yield! classMembers
+            ]
 
         match body with
         | [] -> [ Statement.ellipsis ]
@@ -2607,38 +3508,74 @@ let declareClassType
     let interfaces, stmts =
         // We only use a few interfaces as base classes. The rest is handled as Python protocols (PEP 544) to avoid a massive
         // inheritance tree that will prevent Python of finding a consistent method resolution order.
-        let allowedInterfaces = [ "IDisposable"; "IEnumerator_1" ]
+        // Note: IEquatable_1 and IComparable are NOT mapped to ABC bases because:
+        // 1. Union/Record/ValueType already have Equals/CompareTo in their base classes
+        // 2. Regular classes get mangled method names that don't match ABC abstract methods
+        // 3. Use Py.Equatable/Py.Comparable marker interfaces for classes with override Equals/CompareTo
 
         // Check if class implements IEnumerator_1 (which already inherits from IDisposable)
         let hasIEnumerator =
             ent.AllInterfaces
             |> Seq.exists (fun int -> Helpers.removeNamespace (int.Entity.FullName) = "IEnumerator_1")
 
+        // Check if class implements IEnumerable_1 (avoid duplicate EnumerableBase from Py.Iterable)
+        let hasIEnumerable =
+            ent.AllInterfaces
+            |> Seq.exists (fun int -> Helpers.removeNamespace (int.Entity.FullName) = "IEnumerable_1")
+
+        // Check if class implements IDisposable (avoid duplicate DisposableBase from Py.ContextManager)
+        let hasIDisposable =
+            ent.AllInterfaces
+            |> Seq.exists (fun int -> Helpers.removeNamespace (int.Entity.FullName) = "IDisposable")
+
         ent.AllInterfaces
         |> List.ofSeq
         |> List.filter (fun int ->
             let name = Helpers.removeNamespace (int.Entity.FullName)
             // Filter out IDisposable if IEnumerator_1 is present to avoid diamond inheritance
-            allowedInterfaces |> List.contains name
+            // Filter out Py.Iterable if IEnumerable_1 is present to avoid duplicate EnumerableBase
+            // Filter out Py.ContextManager if IDisposable is present to avoid duplicate DisposableBase
+            Bases.allowedInterfaces |> List.contains name
             && not (hasIEnumerator && name = "IDisposable")
+            && not (hasIEnumerable && name = "Iterable")
+            && not (hasIDisposable && name = "ContextManager")
         )
-        |> List.map (fun int ->
+        |> List.collect (fun int ->
+            let name = Helpers.removeNamespace int.Entity.FullName
+            let fullName = int.Entity.FullName
+
+            // Map interface names to ABC base class(es) using shared helper
+            let abcClasses =
+                match Bases.getAbcClassesForInterface name fullName with
+                | Some classes -> classes
+                | None -> [ name ] // Fallback: use the interface name itself
+
+            // Filter out self-referential generic arguments to avoid forward reference errors
             let genericArgs =
-                match int.GenericArgs with
-                | [ Fable.DeclaredType({ FullName = fullName }, _genericArgs) ] when
-                    Helpers.removeNamespace (fullName) = entName
-                    ->
-                    [ Fable.Type.Any ]
-                | args -> args
+                int.GenericArgs
+                |> List.filter (fun genArg ->
+                    match genArg with
+                    | Fable.DeclaredType({ FullName = fullName }, _) -> Helpers.removeNamespace (fullName) <> entName
+                    | _ -> true
+                )
 
-            let expr, stmts =
-                Annotation.makeEntityTypeAnnotation com ctx int.Entity genericArgs None
-
-            expr, stmts
+            // Generate the ABC base class references
+            abcClasses
+            |> List.map (fun abcClassName ->
+                let expr = Bases.makeAbcBaseExpr com ctx abcClassName genericArgs
+                expr, []
+            )
         )
         |> Helpers.unzipArgs
 
-    let bases = baseExpr |> Option.toList
+    // For abstract classes, add ABC as a base class
+    let abcBase =
+        if ent.IsAbstractClass then
+            [ com.GetImportExpr(ctx, "abc", "ABC") ]
+        else
+            []
+
+    let bases = (baseExpr |> Option.toList) @ abcBase
     let name = com.GetIdentifier(ctx, Naming.toPascalCase entName)
 
     // Check if the class has static properties using proper detection
@@ -2794,46 +3731,45 @@ let tryParseEmitConstructorMacro (macro: string) =
     else
         None
 
-let calculateTypeParams (com: IPythonCompiler) ctx (info: Fable.MemberFunctionOrValue) args returnType bodyType =
+let calculateTypeParams
+    (com: IPythonCompiler)
+    ctx
+    (info: Fable.MemberFunctionOrValue)
+    (argTypes: Fable.Type list)
+    (bodyType: Fable.Type)
+    =
     // Calculate type parameters for Python 3.12 syntax
-    let explicitGenerics =
-        if info.GenericParameters.Length > 0 then
-            info.GenericParameters
-            |> List.map (fun p -> p.Name |> Helpers.clean)
-            |> Set.ofList
-        else
-            Set.empty
+    // Use Fable AST types directly instead of Python AST heuristics
+    let explicitGenerics = Annotation.getMemberGenParams info.GenericParameters
 
     let signatureGenerics =
-        extractGenericParamsFromMethodSignature com ctx args returnType
-
-    let bodyGenerics =
-        // For getters/setters, also extract generics from the method body/return type
-        getGenericTypeParams [ bodyType ] |> Set.difference <| ctx.ScopedTypeParams
+        (getGenericTypeParams (argTypes @ [ bodyType ]), ctx.ScopedTypeParams)
+        ||> Set.difference
 
     let repeatedGenerics =
         Set.empty
         |> Set.union explicitGenerics
         |> Set.union signatureGenerics
-        |> Set.union bodyGenerics
         // Filter out generics that are already defined at class level
         |> Set.difference
         <| ctx.ScopedTypeParams
 
-    makeFunctionTypeParams com ctx repeatedGenerics
+    // Use constraint-aware version to preserve type bounds (e.g., 'T :> IDisposable)
+    Annotation.makeFunctionTypeParamsWithConstraints com ctx info.GenericParameters repeatedGenerics
 
 let transformModuleFunction
     (com: IPythonCompiler)
     ctx
     (info: Fable.MemberFunctionOrValue)
     (membName: string)
-    args
+    (fableArgs: Fable.Ident list)
     body
     =
     let args, body', returnType =
-        getMemberArgsAndBody com ctx (NonAttached membName) info.HasSpread args body
+        getMemberArgsAndBody com ctx (NonAttached membName) info.HasSpread fableArgs body
 
-    let typeParams = calculateTypeParams com ctx info args returnType body.Type
+    let argTypes = fableArgs |> List.map _.Type
+    let typeParams = calculateTypeParams com ctx info argTypes body.Type
     let name = com.GetIdentifier(ctx, membName |> Naming.toPythonNaming)
 
     let isAsync = isTaskType body.Type
@@ -2948,8 +3884,8 @@ let transformAttachedProperty
             let self = Arg.arg "self"
             let arguments = { args with Args = self :: args.Args }
 
-            let typeParams =
-                calculateTypeParams com ctx info arguments returnType memb.Body.Type
+            let argTypes = memb.Args |> List.map _.Type
+            let typeParams = calculateTypeParams com ctx info argTypes memb.Body.Type
 
             let isAsync = isTaskType memb.Body.Type
 
@@ -2957,8 +3893,6 @@ let transformAttachedProperty
             |> List.singleton
 
 let transformAttachedMethod (com: IPythonCompiler) ctx (info: Fable.MemberFunctionOrValue) (memb: Fable.MemberDecl) =
-    // printfn "transformAttachedMethod: %A" memb
-
     let isStatic = not info.IsInstance
 
     // Check if this method has Py.ClassMethod attribute
@@ -2982,10 +3916,11 @@ let transformAttachedMethod (com: IPythonCompiler) ctx (info: Fable.MemberFuncti
           else
               []
 
-    let makeMethod name args body decorators returnType =
-        let key = memberFromName com ctx name |> nameFromKey com ctx
+    let argTypes = memb.Args |> List.map _.Type
+    let typeParams = calculateTypeParams com ctx info argTypes memb.Body.Type
 
-        let typeParams = calculateTypeParams com ctx info args returnType memb.Body.Type
+    let makeMethod name argCount args body decorators returnType =
+        let key = memberFromName com ctx name (Some argCount) |> nameFromKey com ctx
         let isAsync = isTaskType memb.Body.Type
 
         createFunctionWithTypeParams key args body decorators returnType None typeParams isAsync
@@ -3001,64 +3936,23 @@ let transformAttachedMethod (com: IPythonCompiler) ctx (info: Fable.MemberFuncti
         else
             { args with Args = self :: args.Args }
 
+    // Classes that need __iter__ should define it explicitly through interfaces like Py.MutableMapping
     [
-        yield makeMethod memb.Name arguments body decorators returnType
-        if info.FullName = "System.Collections.Generic.IEnumerable.GetEnumerator" then
-            yield
-                makeMethod "__iter__" (Arguments.arguments [ self ]) (enumerator2iterator com ctx) decorators returnType
+        makeMethod memb.Name (List.length memb.Args) arguments body decorators returnType
     ]
 
 let transformUnion (com: IPythonCompiler) ctx (ent: Fable.Entity) (entName: string) classMembers =
-    let fieldIds = getUnionFieldsAsIdents com ctx ent
+    // Get generic type parameters for the union
+    let typeParams = makeEntityTypeParams com ctx ent
 
-    let args, isOptional =
-        let args =
-            fieldIds[0]
-            |> ident com ctx
-            |> (fun id ->
-                let ta, _ = Annotation.typeAnnotation com ctx None fieldIds[0].Type
-                Arg.arg (id, annotation = ta)
-            )
-            |> List.singleton
+    // Get generic parameter names for parameterizing base class in case classes
+    // Use uppercase and clean to match makeTypeParams behavior
+    let genParamNames =
+        ent.GenericParameters
+        |> List.map (fun p -> p.Name.ToUpperInvariant() |> Helpers.clean)
 
-        let varargs =
-            fieldIds[1]
-            |> ident com ctx
-            |> fun id ->
-                let gen = getGenericTypeParams [ fieldIds[1].Type ] |> Set.toList |> List.tryHead
-
-                let ta = Expression.name (gen |> Option.defaultValue "Any")
-                Arg.arg (id, annotation = ta)
-
-
-        let isOptional = Helpers.isOptional fieldIds
-        Arguments.arguments (args = args, vararg = varargs), isOptional
-
-    let body =
-        [
-            yield callSuperAsStatement []
-            yield!
-                fieldIds
-                |> Array.map (fun id ->
-                    let left = get com ctx None thisExpr id.Name false
-
-                    let right =
-                        match id.Type with
-                        | Fable.Number _ -> identAsExpr com ctx id
-                        | Fable.Array _ ->
-                            // Convert varArg from tuple to array. TODO: we might need to do this other places as well.
-                            let array = libValue com ctx "array_" "Array"
-                            let type_obj = com.GetImportExpr(ctx, "typing", "Any")
-                            let types_array = Expression.subscript (value = array, slice = type_obj, ctx = Load)
-                            Expression.call (types_array, [ identAsExpr com ctx id ])
-                        | _ -> identAsExpr com ctx id
-
-                    let ta, _ = Annotation.typeAnnotation com ctx None id.Type
-                    Statement.assign (left, ta, right)
-                )
-        ]
-
-    let cases =
+    // Generate the cases() static method for the base class
+    let casesMethod =
         let expr, stmts =
             ent.UnionCases
             |> Seq.map (getUnionCaseName >> makeStrConst)
@@ -3080,10 +3974,131 @@ let transformUnion (com: IPythonCompiler) ctx (ent: Fable.Entity) (entName: stri
             decoratorList = decorators
         )
 
-    let baseExpr = libValue com ctx "types" "Union" |> Some
-    let classMembers = List.append [ cases ] classMembers
+    // Generate the base class (e.g., MyUnion[T](Union) or MyUnion(Union))
+    let baseUnionExpr = libValue com ctx "union" "Union"
+    // casesMethod is always present, so body is never empty
+    let baseClassBody = casesMethod :: classMembers
 
-    declareType com ctx ent entName args isOptional body baseExpr classMembers None [] []
+    // Base class uses leading underscore (private), type alias gets clean name (public)
+    let baseClassName = com.GetIdentifier(ctx, "_" + entName)
+
+    let baseClassDef =
+        Statement.classDef (baseClassName, bases = [ baseUnionExpr ], body = baseClassBody, typeParams = typeParams)
+
+    // Generate case classes with @tagged_union decorator
+    let caseClasses =
+        ent.UnionCases
+        |> List.mapi (fun tag uci ->
+            // Use full case class name (UnionName_CaseName) to avoid collisions
+            // Pass the entity name to ensure consistent scoping with base class
+            let caseClassName = getUnionCaseClassName com ent uci (Some entName)
+            let caseClassIdent = com.GetIdentifier(ctx, caseClassName)
+
+            // Export the case class for library builds
+            if com.OutputType = OutputType.Library then
+                com.AddExport caseClassName |> ignore
+
+            // Get the tagged_union decorator with the tag number (simple int literal)
+            let taggedUnionDecorator =
+                let taggedUnion = libValue com ctx "union" "tagged_union"
+                let tagLiteral = Expression.intConstant tag
+                Expression.call (taggedUnion, [ tagLiteral ])
+
+            // Generate field annotations for the case class (field: type syntax)
+            // Use a context without EnclosingUnionBaseClass so field types use type alias
+            let caseCtx = { ctx with EnclosingUnionBaseClass = None }
+
+            let fieldAnnotations =
+                uci.UnionCaseFields
+                |> List.map (fun field ->
+                    // Convert to snake_case and clean to remove invalid characters like apostrophes
+                    // Handles: "Item" -> "item", "Item1" -> "item1", "MyField" -> "my_field"
+                    let fieldName = field.Name |> Naming.toSnakeCase |> Helpers.clean
+                    // Uncurry lambda types for field annotations since union case fields
+                    // store uncurried functions at runtime (same as record fields)
+                    let fieldType =
+                        match field.FieldType with
+                        | Fable.LambdaType _ -> FableTransforms.uncurryType field.FieldType
+                        | _ -> field.FieldType
+
+                    let ta, _ = Annotation.typeAnnotation com caseCtx None fieldType
+                    let target = Expression.name (fieldName, Store)
+                    // Use annAssign to generate: field: type (not field = type)
+                    Statement.annAssign (target, annotation = ta, simple = true)
+                )
+
+            let caseClassBody =
+                match fieldAnnotations with
+                | [] -> [ Statement.ellipsis ]
+                | _ -> fieldAnnotations
+
+            // The case class inherits from the parameterized base union class
+            // e.g., class Either_Left[TL, TR](_Either_2[TL, TR]): ...
+            let baseClassExpr =
+                Expression.name ("_" + entName)
+                |> Annotation.makeGenericParamSubscript genParamNames
+
+            Statement.classDef (
+                caseClassIdent,
+                bases = [ baseClassExpr ],
+                body = caseClassBody,
+                decoratorList = [ taggedUnionDecorator ],
+                typeParams = typeParams
+            )
+        )
+
+    // Generate type alias: type MyUnion[T] = MyUnion_CaseA[T] | MyUnion_CaseB[T] | ...
+    // The type alias uses the clean name (public API), base class uses underscore prefix (private)
+    let typeAlias =
+        let aliasName = Expression.name entName
+
+        // If generic, parameterize each case type
+        let caseTypes =
+            ent.UnionCases
+            |> List.map (fun uci ->
+                // Use the full case class name (UnionName_CaseName)
+                let caseClassName = getUnionCaseClassName com ent uci (Some entName)
+
+                Expression.name caseClassName
+                |> Annotation.makeGenericParamSubscript genParamNames
+            )
+
+        let unionType =
+            match caseTypes with
+            | [] -> Expression.name "None"
+            | [ single ] -> single
+            | first :: rest -> List.fold (fun acc t -> Expression.binOp (acc, BitOr, t)) first rest
+
+        Statement.typeAlias (aliasName, unionType, typeParams = typeParams)
+
+    // Generate reflection declaration for the union type (same as for records/classes)
+    let reflectionDeclaration, reflectionStmts =
+        let ta = fableModuleAnnotation com ctx "reflection" "TypeInfo" []
+
+        let genArgs =
+            Array.init ent.GenericParameters.Length (fun i -> "gen" + string<int> i |> makeIdent)
+
+        let args =
+            genArgs
+            |> Array.mapToList (fun id -> Arg.arg (ident com ctx id, annotation = ta))
+
+        let args = Arguments.arguments args
+        let generics = genArgs |> Array.mapToList (identAsExpr com ctx)
+
+        let body, stmts = transformReflectionInfo com ctx None ent generics
+        let expr, stmts' = makeFunctionExpression com ctx None (args, body, [], ta)
+
+        let name =
+            com.GetIdentifier(ctx, Naming.toPascalCase entName + Naming.reflectionSuffix)
+
+        expr |> declareModuleMember com ctx ent.IsPublic name None, stmts @ stmts'
+
+    // Return all statements: base class, case classes, type alias, reflection
+    reflectionStmts
+    @ [ baseClassDef ]
+    @ caseClasses
+    @ [ typeAlias ]
+    @ reflectionDeclaration
 
 let transformClassWithCompilerGeneratedConstructor
     (com: IPythonCompiler)
@@ -3105,9 +4120,9 @@ let transformClassWithCompilerGeneratedConstructor
 
     let baseExpr =
         if ent.IsFSharpExceptionDeclaration then
-            libValue com ctx "types" "FSharpException" |> Some
+            libValue com ctx "exceptions" "FSharpException" |> Some
         elif ent.IsFSharpRecord || ent.IsValueType then
-            libValue com ctx "types" "Record" |> Some
+            libValue com ctx "record" "Record" |> Some
         else
             None
 
@@ -3256,32 +4271,58 @@ let transformClassWithPrimaryConstructor
     let isOptional = Helpers.isOptional (cons.Args |> Array.ofList)
 
     // Change exposed constructor's return type from None to entity type.
+    // Use None for repeatedGenerics to include all class type parameters in the return type,
+    // not just those that appear in constructor arguments. The exposed constructor wrapper
+    // declares all class type params as function type params, so they're all in scope.
     let returnType =
-        let availableGenerics =
-            cons.Args |> List.map (fun arg -> arg.Type) |> getGenericTypeParams
-
         let genParams = getEntityGenParams classEnt
 
-        makeGenericTypeAnnotation' com ctx classDecl.Name (genParams |> List.ofSeq) (Some availableGenerics)
+        makeGenericTypeAnnotation' com ctx classDecl.Name (genParams |> List.ofSeq) None
 
     let exposedCons =
         if classAttributes.Style = ClassStyle.Attributes && not classAttributes.Init then
             // For attributes style with init=false, don't generate an exposed constructor
             // since there's no __init__ method to call
             []
+        elif classEnt.IsAbstractClass then
+            // Don't generate exposed constructor for abstract classes since they can't be instantiated
+            []
         else
             let argExprs = consArgs.Args |> List.map (fun p -> Expression.identifier p.Arg)
-
             let exposedConsBody = Expression.call (classIdent, argExprs)
             let name = com.GetIdentifier(ctx, cons.Name)
-            [ makeFunction name (consArgs, exposedConsBody, [], returnType) ]
+
+            // Calculate type parameters for the exposed constructor wrapper
+            // The exposed constructor is a module-level function, so it needs to declare
+            // all type params including the class's type params (which are in ctx.ScopedTypeParams)
+            let argTypes = cons.Args |> List.map _.Type
+
+            let returnFableType =
+                let genTypes =
+                    classEnt.GenericParameters
+                    |> List.map (fun gp -> Fable.Type.GenericParam(gp.Name, gp.IsMeasure, gp.Constraints))
+
+                Fable.DeclaredType(classDecl.Entity, genTypes)
+
+            // Use empty ScopedTypeParams since this is a module-level function
+            let ctxForExposedCons = { ctx with ScopedTypeParams = Set.empty }
+            let info = com.GetMember(cons.MemberRef)
+
+            let typeParams =
+                calculateTypeParams com ctxForExposedCons info argTypes returnFableType
+
+            let body = wrapExprInBlockWithReturn (exposedConsBody, [])
+
+            [
+                createFunctionWithTypeParams name consArgs body [] returnType None typeParams false
+            ]
 
     let baseExpr, consBody =
         classDecl.BaseCall
         |> extractBaseExprFromBaseCall com ctx classEnt.BaseType
         |> Option.orElseWith (fun () ->
             if classEnt.IsValueType then
-                Some(libValue com ctx "Types" "Record", ([], [], []))
+                Some(libValue com ctx "record" "Record", ([], [], []))
             else
                 None
         )
@@ -3315,6 +4356,9 @@ let transformInterface (com: IPythonCompiler) ctx (classEnt: Fable.Entity) (_cla
     // printfn "transformInterface"
     let classIdent = com.GetIdentifier(ctx, Helpers.removeNamespace classEnt.FullName)
 
+    // Check if interface has [<Mangle>] attribute
+    let isMangled = hasAttribute Atts.mangle classEnt.Attributes
+
     let members =
         classEnt.MembersFunctionsAndValues
         |> Seq.filter (fun memb ->
@@ -3334,15 +4378,26 @@ let transformInterface (com: IPythonCompiler) ctx (classEnt: Fable.Entity) (_cla
     let classMembers =
         [
             for memb in members do
-                let name = memb.DisplayName |> Naming.toPythonNaming |> Helpers.clean
+                // Use mangled name if interface has [<Mangle>] attribute
+                let name =
+                    if isMangled then
+                        Bases.InterfaceNaming.getMangledMemberName classEnt memb
+                    elif memb.IsGetter || memb.IsSetter then
+                        memb.CompiledName
+                        |> Naming.removeGetSetPrefix
+                        |> Naming.toPythonNaming
+                        |> Helpers.clean
+                    else
+                        memb.DisplayName |> Naming.toPythonNaming |> Helpers.clean
 
                 let abstractMethod = com.GetImportExpr(ctx, "abc", "abstractmethod")
 
+                // For mangled interfaces, don't use @property decorators - members are plain methods
                 let decorators =
                     [
-                        if memb.IsValue || memb.IsGetter then
+                        if not isMangled && (memb.IsValue || memb.IsGetter) then
                             Expression.name "property"
-                        if memb.IsSetter then
+                        if not isMangled && memb.IsSetter then
                             Expression.name $"%s{name}.setter"
 
                         abstractMethod
@@ -3351,24 +4406,63 @@ let transformInterface (com: IPythonCompiler) ctx (classEnt: Fable.Entity) (_cla
                 let name = com.GetIdentifier(ctx, name)
 
                 let args =
-                    let args =
+                    // Make protocol method parameters positional-only (using /) to avoid
+                    // parameter name mismatch errors when subclasses use different names
+                    // (e.g., value_1 instead of value due to closure captures)
+                    let allParams =
+                        memb.CurriedParameterGroups
+                        |> Seq.indexed
+                        |> Seq.collect (fun (n, parameterGroup) ->
+                            parameterGroup |> Seq.indexed |> Seq.map (fun (m, pg) -> (n + m, pg))
+                        )
+                        |> Seq.toList
+
+                    // Split regular params from vararg param using shared helper
+                    let regularParams, varArgParam = splitVarArg memb.HasSpread allParams
+
+                    let posOnlyArgs =
                         [
                             if memb.IsInstance then
                                 Arg.arg "self"
-                            for n, parameterGroup in memb.CurriedParameterGroups |> Seq.indexed do
-                                for m, pg in parameterGroup |> Seq.indexed do
-                                    let ta, _ = Annotation.typeAnnotation com ctx None pg.Type
 
-                                    Arg.arg (pg.Name |> Option.defaultValue $"__arg%d{n + m}", annotation = ta)
+                            for idx, pg in regularParams do
+                                // Uncurry function types to match class implementations
+                                // F# interface uses curried types (LambdaType) but class methods
+                                // use uncurried types (DelegateType) at runtime
+                                let paramType = FableTransforms.uncurryType pg.Type
+                                let ta, _ = Annotation.typeAnnotation com ctx None paramType
+
+                                Arg.arg (pg.Name |> Option.defaultValue $"__arg%d{idx}", annotation = ta)
                         ]
 
-                    Arguments.arguments args
+                    // For vararg parameter, extract element type from array type for annotation
+                    let vararg =
+                        varArgParam
+                        |> Option.map (fun (_idx, pg) ->
+                            let elementType = getVarArgElementType pg.Type
+                            let ta, _ = Annotation.typeAnnotation com ctx None elementType
+                            Arg.arg (pg.Name |> Option.defaultValue "rest", annotation = ta)
+                        )
 
-                let returnType, _ = Annotation.typeAnnotation com ctx None memb.ReturnParameter.Type
+                    Arguments.arguments (posonlyargs = posOnlyArgs, ?vararg = vararg)
+
+                // Also uncurry return type for consistency with class implementations
+                let uncurriedReturnType = FableTransforms.uncurryType memb.ReturnParameter.Type
+                let returnType, _ = Annotation.typeAnnotation com ctx None uncurriedReturnType
 
                 let body = [ Statement.ellipsis ]
 
-                Statement.functionDef (name, args, body, returns = returnType, decoratorList = decorators)
+                // Calculate type parameters for generic abstract methods
+                let typeParams = Annotation.makeMemberTypeParams com ctx memb.GenericParameters
+
+                Statement.functionDef (
+                    name,
+                    args,
+                    body,
+                    returns = returnType,
+                    decoratorList = decorators,
+                    typeParams = typeParams
+                )
 
             if members.IsEmpty then
                 Statement.Pass
@@ -3392,9 +4486,10 @@ let transformInterface (com: IPythonCompiler) ctx (classEnt: Fable.Entity) (_cla
                     expr
                 | None -> ()
 
-            // Only add Protocol base if no interfaces (since the included interfaces will be protocols themselves)
-            if List.isEmpty interfaces then
-                com.GetImportExpr(ctx, "typing", "Protocol")
+            // Always add Protocol as explicit base class for interfaces.
+            // Per PEP 544: subclassing a protocol doesn't make the subclass a protocol
+            // unless it also has typing.Protocol as an explicit base class.
+            com.GetImportExpr(ctx, "typing", "Protocol")
 
         // Python 3.12: Generic type parameters are handled in class definition, not as base classes
         ]
@@ -3409,7 +4504,7 @@ let transformInterface (com: IPythonCompiler) ctx (classEnt: Fable.Entity) (_cla
 // Helper function to extract initial value from getter body
 // Returns (value, isFactory, externalFields, stmts) where isFactory indicates if the value is a lambda function,
 // externalFields contains field names that need to be added as class attributes
-// and stmts contains statements (e.g., local function declarations) from closurd that need lifted out of the
+// and stmts contains statements (e.g., local function declarations) from closures that need lifted out of the
 // to the nearest enclosing scope.
 let getInitialValue
     com
@@ -3693,6 +4788,12 @@ let rec transformDeclaration (com: IPythonCompiler) ctx (decl: Fable.Declaration
                     let value, stmts = transformAsExpr com ctx decl.Body
                     let name = com.GetIdentifier(ctx, Naming.toPythonNaming decl.Name)
                     let ta, _ = Annotation.typeAnnotation com ctx None decl.Body.Type
+                    // Erase Option wrapper if needed (Call/CurriedApply returning Option[T] to T | None)
+                    let value =
+                        if needsOptionEraseForBinding decl.Body decl.Body.Type then
+                            wrapInOptionErase com ctx value
+                        else
+                            value
 
                     stmts @ declareModuleMember com ctx info.IsPublic name (Some ta) value
                 else
@@ -3749,6 +4850,14 @@ let rec transformDeclaration (com: IPythonCompiler) ctx (decl: Fable.Declaration
             let ctx =
                 { ctx with ScopedTypeParams = Set.union ctx.ScopedTypeParams classGenericParams }
 
+            // For union types, set the enclosing base class context so type annotations
+            // inside base class methods use the base class name instead of type alias
+            let ctx =
+                if ent.IsFSharpUnion then
+                    { ctx with EnclosingUnionBaseClass = Some decl.Name }
+                else
+                    ctx
+
             let classMembers =
                 decl.AttachedMembers
                 |> List.collect (fun memb ->
@@ -3769,8 +4878,19 @@ let rec transformDeclaration (com: IPythonCompiler) ctx (decl: Fable.Declaration
             let staticPropertyDeclarations, setterFunctions, backingFieldDeclarations =
                 transformStaticProperties com ctx decl ent
 
+            // Generate abstract method stubs for abstract classes
+            let abstractMethodStubs =
+                Bases.generateAbstractMethodStubs com ctx ent decl.AttachedMembers
+
+            // Generate Python protocol dunders for Py.Mapping and Py.Set interfaces
+            let pythonProtocolDunders = Bases.generatePythonProtocolDunders com ctx ent
+
             let allClassMembers =
-                classMembers @ backingFieldDeclarations @ staticPropertyDeclarations
+                classMembers
+                @ backingFieldDeclarations
+                @ staticPropertyDeclarations
+                @ abstractMethodStubs
+                @ pythonProtocolDunders
 
             let allStatements = setterFunctions
 
@@ -3799,7 +4919,7 @@ let transformTypeVars (com: IPythonCompiler) ctx (typeVars: HashSet<string>) =
     []
 
 let transformExports (_com: IPythonCompiler) _ctx (exports: HashSet<string>) =
-    let exports = exports |> List.ofSeq
+    let exports = exports |> List.ofSeq |> List.sort
 
     match exports with
     | [] -> []
@@ -3908,6 +5028,7 @@ let transformFile (com: IPythonCompiler) (file: Fable.File) =
             ScopedTypeParams = Set.empty
             TypeParamsScope = 0
             NarrowedTypes = Map.empty
+            EnclosingUnionBaseClass = None
         }
 
     // printfn "file: %A" file.Declarations

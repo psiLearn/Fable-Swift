@@ -62,6 +62,11 @@ class UInt8(NumericInts):
     SIXTY_FOUR: ClassVar[UInt8]
     NEG_ONE: ClassVar[UInt8]
 
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> UInt8: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
+
 @final
 class Int8(NumericInts):
     ZERO: ClassVar[Int8]
@@ -79,6 +84,11 @@ class Int8(NumericInts):
     THIRTY_TWO: ClassVar[Int8]
     SIXTY_FOUR: ClassVar[Int8]
     NEG_ONE: ClassVar[Int8]
+
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> Int8: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
 
 @final
 class UInt16(NumericInts):
@@ -98,6 +108,11 @@ class UInt16(NumericInts):
     SIXTY_FOUR: ClassVar[UInt16]
     NEG_ONE: ClassVar[UInt16]
 
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> UInt16: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
+
 @final
 class Int16(NumericInts):
     ZERO: ClassVar[Int16]
@@ -116,6 +131,11 @@ class Int16(NumericInts):
     SIXTY_FOUR: ClassVar[Int16]
     NEG_ONE: ClassVar[Int16]
 
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> Int16: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
+
 @final
 class UInt32(NumericInts):
     ZERO: ClassVar[UInt32]
@@ -133,6 +153,11 @@ class UInt32(NumericInts):
     THIRTY_TWO: ClassVar[UInt32]
     SIXTY_FOUR: ClassVar[UInt32]
     NEG_ONE: ClassVar[UInt32]
+
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> UInt32: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
 
 @final
 class Int32(NumericInts, int):
@@ -153,6 +178,11 @@ class Int32(NumericInts, int):
     SIXTY_FOUR: ClassVar[Int32]
     NEG_ONE: ClassVar[Int32]
 
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> Int32: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
+
 @final
 class UInt64(NumericInts):
     ZERO: ClassVar[UInt64]
@@ -170,6 +200,11 @@ class UInt64(NumericInts):
     THIRTY_TWO: ClassVar[UInt64]
     SIXTY_FOUR: ClassVar[UInt64]
     NEG_ONE: ClassVar[UInt64]
+
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> UInt64: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
 
 @final
 class Int64(NumericInts):
@@ -189,25 +224,31 @@ class Int64(NumericInts):
     SIXTY_FOUR: ClassVar[Int64]
     NEG_ONE: ClassVar[Int64]
 
+    @staticmethod
+    def parse(string: str, style: SupportsInt, radix: SupportsInt = ...) -> Int64: ...
+    @staticmethod
+    def try_parse(string: str, style: SupportsInt, def_value: Any) -> bool: ...
+
 # Integer parsing functions with F#-compatible semantics
 def parse_int32(
     string: str,
     style: int,
     unsigned: bool,
+    bitsize: int,
     radix: int = 10,
 ) -> Int32:
     """
     Parses a string representation of a 32-bit integer with F#-compatible semantics.
-    This function matches the behavior of int32.py parse function exactly.
 
     Args:
         string: The string to parse
         style: NumberStyles flags controlling parsing behavior
         unsigned: Whether to treat the result as unsigned (u32)
+        bitsize: The bit width of the target type (8, 16, or 32)
         radix: Default radix to use (defaults to 10)
 
     Returns:
-        The parsed integer value as int
+        The parsed integer value
 
     Raises:
         ValueError: If the string is not in a valid format or value is out of range
@@ -218,20 +259,21 @@ def parse_int64(
     string: str,
     style: int,
     unsigned: bool,
+    bitsize: int,
     radix: int = 10,
 ) -> Int64:
     """
     Parses a string representation of a 64-bit integer with F#-compatible semantics.
-    This function matches the behavior of long.py parse function exactly.
 
     Args:
         string: The string to parse
         style: NumberStyles flags controlling parsing behavior
         unsigned: Whether to treat the result as unsigned (u64)
+        bitsize: The bit width (64)
         radix: Default radix to use (defaults to 10)
 
     Returns:
-        The parsed integer value as int
+        The parsed integer value
 
     Raises:
         ValueError: If the string is not in a valid format or value is out of range
@@ -242,8 +284,8 @@ def try_parse_int32(
     string: str,
     style: int,
     unsigned: bool,
+    bitsize: int,
     def_value: Any,
-    radix: int = 10,
 ) -> bool:
     """
     Attempts to parse a 32-bit integer with F#-style try semantics.
@@ -252,8 +294,8 @@ def try_parse_int32(
         string: The string to parse
         style: NumberStyles flags controlling parsing behavior
         unsigned: Whether to treat the result as unsigned (u32)
+        bitsize: The bit width of the target type (8, 16, or 32)
         def_value: Python object reference to store the result on success
-        radix: Default radix to use (defaults to 10)
 
     Returns:
         True if parsing succeeded, False otherwise
@@ -264,8 +306,8 @@ def try_parse_int64(
     string: str,
     style: int,
     unsigned: bool,
+    bitsize: int,
     def_value: Any,
-    radix: int = 10,
 ) -> bool:
     """
     Attempts to parse a 64-bit integer with F#-style try semantics.
@@ -274,8 +316,8 @@ def try_parse_int64(
         string: The string to parse
         style: NumberStyles flags controlling parsing behavior
         unsigned: Whether to treat the result as unsigned (u64)
+        bitsize: The bit width (64)
         def_value: Python object reference to store the result on success
-        radix: Default radix to use (defaults to 10)
 
     Returns:
         True if parsing succeeded, False otherwise

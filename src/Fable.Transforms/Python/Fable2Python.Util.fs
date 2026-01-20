@@ -32,6 +32,64 @@ module Lib =
 module Util =
     open Lib
 
+    /// Returns true if this is a core library union type (Result, Choice) in user code
+    /// that should import case constructors from fable_library.
+    /// Only matches Microsoft.FSharp.Core.* (user code), not FSharp.Core.* (library source)
+    /// to avoid circular imports when compiling the library itself.
+    let isLibraryUnionType (fullName: string) =
+        match fullName with
+        | Types.result -> true
+        | fn when fn.StartsWith("Microsoft.FSharp.Core.FSharpChoice`", StringComparison.Ordinal) -> true
+        | _ -> false
+
+    /// Returns true if this union type should use simple case names (Choice1Of2, Ok, Error)
+    /// rather than prefixed names (MyUnion_Case1). Used for naming case classes.
+    /// This matches both user code (Microsoft.FSharp.Core.*) and library source (FSharp.Core.*).
+    let usesSimpleCaseNames (fullName: string) =
+        match fullName with
+        | Types.result -> true
+        | fn when fn.StartsWith("Microsoft.FSharp.Core.FSharpChoice`", StringComparison.Ordinal) -> true
+        | fn when fn.StartsWith("FSharp.Core.FSharpChoice`", StringComparison.Ordinal) -> true
+        | "FSharp.Core.FSharpResult`2" -> true
+        | _ -> false
+
+    /// Ensures a statement list is non-empty by adding Pass if needed.
+    /// Python requires at least one statement in function/class/match bodies.
+    let ensureNonEmptyBody stmts =
+        match stmts with
+        | [] -> [ Statement.Pass ]
+        | _ -> stmts
+
+    /// Extract the element type from an array type for vararg annotations.
+    /// For Array<T>, returns T. For other types, returns Any as fallback.
+    let getVarArgElementType (paramType: Fable.Type) : Fable.Type =
+        match paramType with
+        | Fable.Array(elemType, _) -> elemType
+        | _ -> Fable.Any // Fallback if not array type
+
+    /// Splits a list of items into regular items and an optional vararg item.
+    /// When hasSpread is true and items is non-empty, the last item becomes the vararg.
+    let splitVarArg<'T> (hasSpread: bool) (items: 'T list) : 'T list * 'T option =
+        if hasSpread && not items.IsEmpty then
+            let regular = items |> List.take (items.Length - 1)
+            let vararg = items |> List.last
+            regular, Some vararg
+        else
+            items, None
+
+    /// Adjusts Arguments to move the last arg to vararg when hasSpread is true.
+    /// Removes the annotation from vararg since Python infers it from *args.
+    let adjustArgsForSpread (hasSpread: bool) (args: Arguments) : Arguments =
+        let len = args.Args.Length
+
+        if not hasSpread || len = 0 then
+            args
+        else
+            { args with
+                VarArg = Some { args.Args[len - 1] with Annotation = None }
+                Args = args.Args[.. len - 2]
+            }
+
     let hasAttribute fullName (atts: Fable.Attribute seq) =
         atts |> Seq.exists (fun att -> att.Entity.FullName = fullName)
 
@@ -41,6 +99,188 @@ module Util =
         || hasAttribute Atts.emitConstructor atts
         || hasAttribute Atts.emitIndexer atts
         || hasAttribute Atts.emitProperty atts
+
+    /// Check if a type contains any generic parameters (recursively).
+    /// Used to determine if Option<T> should use Option[T] annotation vs T | None.
+    /// Note: This is duplicated from Annotation.fs due to compilation order (Util.fs compiles first).
+    let private containsGenericParams (t: Fable.Type) =
+        FSharp2Fable.Util.getGenParamNames [ t ] |> List.isEmpty |> not
+
+    /// Check if an Option type has a concrete inner type (erases to T | None).
+    /// Returns true when inner type is concrete, meaning Option[T] -> T | None.
+    let hasConcreteOptionInner (typ: Fable.Type) =
+        match typ with
+        | Fable.Option(innerType, _) -> not (mustWrapOption innerType)
+        | _ -> false
+
+    /// Check if inner type of Option is a callable with generic params (needs wrapping)
+    let private isCallableWithGenerics (t: Fable.Type) =
+        match t with
+        | Fable.LambdaType _
+        | Fable.DelegateType _ -> containsGenericParams t
+        | _ -> false
+
+    /// Check if a call expression needs Option erase from Option[T] to T | None.
+    /// When target type is Option<ConcreteType> (erased to T | None), we need to erase
+    /// because library functions use Option[T] (wrapped form) in their signatures,
+    /// but actual runtime values are not wrapped for concrete types.
+    /// Also handles function types (LambdaType) where the return type contains a concrete Option,
+    /// using the erase() overload for Callable[..., Option[T]] -> Callable[..., T | None].
+    let rec private needsOptionEraseForCall (targetType: Fable.Type) =
+        match targetType with
+        // Don't erase if inner type is callable with generic params - both annotation and runtime use wrapped form
+        | Fable.Option(tgtInner, _) when not (mustWrapOption tgtInner) && not (isCallableWithGenerics tgtInner) -> true
+        // Handle function types where return type is a concrete Option
+        // erase() has an overload: Callable[..., Option[T]] -> Callable[..., T | None]
+        | Fable.LambdaType(_, returnType) -> needsOptionEraseForCall returnType
+        | Fable.DelegateType(_, returnType) -> needsOptionEraseForCall returnType
+        | _ -> false
+
+    /// Check if binding needs Option erase from Option[T] to T | None.
+    let needsOptionEraseForBinding (value: Fable.Expr) (targetType: Fable.Type) =
+        match value with
+        | Fable.Call _
+        | Fable.CurriedApply _ -> needsOptionEraseForCall targetType
+        | _ -> false
+
+    /// Check if return expression needs Option erase from Option[T] to T | None.
+    /// Used when returning from a function where the expected return type is T | None
+    /// but the actual expression returns Option[T] (wrapped form).
+    let needsOptionEraseForReturn (value: Fable.Expr) (expectedReturnType: Fable.Type) =
+        match value with
+        | Fable.Call _
+        | Fable.CurriedApply _ -> needsOptionEraseForCall expectedReturnType
+        | _ -> false
+
+    /// Recursively check if a type contains Option (wrapped or erased).
+    let rec private containsOption (typ: Fable.Type) =
+        match typ with
+        | Fable.Option _ -> true
+        | Fable.Tuple(types, _) -> types |> List.exists containsOption
+        | Fable.Array(elemType, _) -> containsOption elemType
+        | Fable.List elemType -> containsOption elemType
+        | _ -> false
+
+    /// Check if a type is an invariant container (Array or List) with Options inside.
+    /// This detects cases where function return types use Option[T] for generics
+    /// but variable annotations would use T | None for concrete types, causing
+    /// invariance mismatch errors in Pyright.
+    let private isInvariantContainerWithOptions (typ: Fable.Type) =
+        match typ with
+        | Fable.Array(elemType, _) -> containsOption elemType
+        | Fable.List elemType -> containsOption elemType
+        | _ -> false
+
+    /// Check if we should skip type annotation to avoid Option[T] vs T | None mismatch.
+    /// When a Call returns an invariant container (Array/List) with Options inside,
+    /// the function signature uses Option[T] for generics, but the variable annotation
+    /// would use erased T | None. Since Array/List are invariant, this causes type errors.
+    /// Skip the annotation and let Python infer from function return type.
+    let valueExtractsFromInvariantContainer (value: Fable.Expr) (varType: Fable.Type) =
+        match value with
+        | Fable.Call _ ->
+            // When a call returns an invariant container with Options, skip annotation
+            isInvariantContainerWithOptions varType
+        | Fable.Get(_, Fable.ListHead, _, _) -> containsOption varType
+        | Fable.Get(_, Fable.ListTail, _, _) -> containsOption varType
+        | Fable.Get(expr, Fable.ExprGet _, _, _) -> isInvariantContainerWithOptions expr.Type && containsOption varType
+        | _ -> false
+
+    /// Check if a binding is assigning from a wrapped option after None check.
+    /// Pattern: `if x is not None: x2 = x` where x has wrapped Option type.
+    /// After narrowing, x is SomeWrapper[T] | T, but annotation expects T.
+    /// Skip annotation to avoid type mismatch.
+    let isWrappedOptionNarrowingAssignment (value: Fable.Expr) =
+        match value with
+        | Fable.IdentExpr ident ->
+            // Check if the source has a wrapped option type
+            match ident.Type with
+            | Fable.Option(innerType, _) -> mustWrapOption innerType
+            | _ -> false
+        | _ -> false
+
+    /// Get narrowed contexts for then/else branches based on a guard expression
+    /// Returns (thenCtx, elseCtx) with appropriate type narrowing applied
+    let getNarrowedContexts (ctx: Context) (guardExpr: Fable.Expr) : Context * Context =
+        match guardExpr with
+        | Fable.Test(Fable.IdentExpr ident, Fable.TypeTest typ, _) ->
+            // TypeTest: then branch has the narrowed type
+            { ctx with NarrowedTypes = Map.add ident.Name typ ctx.NarrowedTypes }, ctx
+        | Fable.Test(Fable.IdentExpr ident, Fable.OptionTest nonEmpty, _) ->
+            // OptionTest: only narrow for erased options (T | None), not wrapped options (Option[T])
+            // Wrapped options require value() call to unwrap, so the type doesn't change
+            match ident.Type with
+            | Fable.Option(innerType, _) when not (mustWrapOption innerType) ->
+                // Erased option: type narrows from T | None to T
+                if nonEmpty then
+                    // v is not None: then branch has the unwrapped type
+                    { ctx with NarrowedTypes = Map.add ident.Name innerType ctx.NarrowedTypes }, ctx
+                else
+                    // v is None: else branch has the unwrapped type
+                    ctx, { ctx with NarrowedTypes = Map.add ident.Name innerType ctx.NarrowedTypes }
+            | _ ->
+                // Wrapped option or non-option: no type narrowing
+                ctx, ctx
+        | _ -> ctx, ctx
+
+    /// Recursively check if a type contains Option with generic parameter that requires wrapping.
+    /// This checks return types of lambdas for Option[GenericParam].
+    let rec private hasWrappedOptionInReturnType (typ: Fable.Type) =
+        match typ with
+        | Fable.LambdaType(_, returnType) ->
+            // Check if return type is Option[GenericParam] or recurse into nested lambdas
+            match returnType with
+            | Fable.Option(inner, _) -> mustWrapOption inner
+            | Fable.LambdaType _ -> hasWrappedOptionInReturnType returnType
+            | _ -> false
+        | _ -> false
+
+    /// Check if a type would have its Option return type erased (T | None instead of Option[T]).
+    /// Returns true when the return type is Option[ConcreteType] which gets erased.
+    let rec private hasErasedOptionReturnType (typ: Fable.Type) =
+        match typ with
+        | Fable.LambdaType(_, returnType) ->
+            match returnType with
+            | Fable.Option(inner, _) -> not (mustWrapOption inner) // Erased when NOT wrapped
+            | Fable.LambdaType _ -> hasErasedOptionReturnType returnType
+            | _ -> false
+        | _ -> false
+
+    /// Check if a callback argument needs widen() to convert erased Option callback
+    /// to wrapped Option form for type checker compatibility.
+    /// Returns true when:
+    /// - Expected type is Callable with Option[GenericParam] in return position
+    /// - Actual arg is a lambda/function that would have erased Option return type
+    let needsOptionWidenForArg (expectedType: Fable.Type option) (argExpr: Fable.Expr) =
+        match expectedType with
+        | Some sigType when hasWrappedOptionInReturnType sigType ->
+            // Check if argument is a callable with ERASED Option return type
+            // If arg already has wrapped Option return, don't apply widen()
+            match argExpr with
+            | Fable.Lambda _
+            | Fable.Delegate _ ->
+                // Check if the lambda's return type would be erased
+                hasErasedOptionReturnType argExpr.Type
+            | Fable.IdentExpr ident ->
+                // Check if the identifier's type has erased Option return
+                hasErasedOptionReturnType ident.Type
+            | Fable.Get(_, Fable.FieldGet fieldInfo, _, _) ->
+                // Field access to a function
+                match fieldInfo.FieldType with
+                | Some typ -> hasErasedOptionReturnType typ
+                | None -> false
+            | _ -> false
+        | _ -> false
+
+    /// Wraps None values in cast(type, None) for type safety.
+    /// Skips if type annotation is also None (unit type).
+    let wrapNoneInCast (com: IPythonCompiler) ctx (value: Expression) (typeAnnotation: Expression) : Expression =
+        match value, typeAnnotation with
+        | Expression.Name { Id = Identifier "None" }, Expression.Name { Id = Identifier "None" } -> value // No cast needed for None: None = None
+        | Expression.Name { Id = Identifier "None" }, _ ->
+            let cast = com.GetImportExpr(ctx, "typing", "cast")
+            Expression.call (cast, [ typeAnnotation; value ])
+        | _ -> value
 
     let parseClassStyle (styleStr: int) =
         match styleStr with
@@ -223,13 +463,13 @@ module Util =
         name
 
     /// Determines if we should use the special record field naming convention (toRecordFieldSnakeCase)
-    /// for the given entity. Returns true for user-defined F# records, false for built-in F# Core types.
+    /// for the given entity. Returns true for user-defined F# records, false for built-in types.
     let shouldUseRecordFieldNaming (ent: Fable.Entity) =
         ent.IsFSharpRecord
         && not (ent.FullName.StartsWith("Microsoft.FSharp.Core", StringComparison.Ordinal))
 
     /// Determines if we should use the special record field naming convention (toRecordFieldSnakeCase)
-    /// for the given entity reference. Returns true for user-defined F# records, false for built-in F# Core types.
+    /// for the given entity reference. Returns true for user-defined F# records, false for built-in types.
     let shouldUseRecordFieldNamingForRef (entityRef: Fable.EntityRef) (ent: Fable.Entity) =
         ent.IsFSharpRecord
         && not (entityRef.FullName.StartsWith("Microsoft.FSharp.Core", StringComparison.Ordinal))
@@ -249,7 +489,7 @@ module Util =
             | None -> InstancePropertyBacking // Conservative fallback for unknown entities
         | _ -> RegularField
 
-    /// Checks if a field name is an actual record field (not a property/method defined on the record)
+    /// Checks if a field name is an actual record field (not a property/method)
     let isRecordField (ent: Fable.Entity) (fieldName: string) =
         ent.FSharpFields |> List.exists (fun f -> f.Name = fieldName)
 
@@ -363,31 +603,24 @@ module Util =
 
     let ofInt (com: IPythonCompiler) (ctx: Context) (i: int) =
         //Expression.intConstant (int i)
-        libCall com ctx None "util" "int32" [ Expression.intConstant (int i) ]
+        libCall com ctx None "core" "int32" [ Expression.intConstant (int i) ]
 
     let ofString (s: string) = Expression.stringConstant s
 
-    let memberFromName (_com: IPythonCompiler) (_ctx: Context) (memberName: string) : Expression =
-        // printfn "memberFromName: %A" memberName
-        match memberName with
-        | "ToString" -> Expression.identifier "__str__"
-        //| "GetHashCode" -> Expression.identifier "__hash__"
-        | "Equals" -> Expression.identifier "__eq__"
-        | "CompareTo" -> Expression.identifier "__cmp__"
-        | "set" -> Expression.identifier "__setitem__"
-        | "get" -> Expression.identifier "__getitem__"
-        | "has" -> Expression.identifier "__contains__"
-        | "delete" -> Expression.identifier "__delitem__"
-        | n when n.EndsWith("get_Count", StringComparison.Ordinal) -> Expression.identifier "__len__" // TODO: find a better way
-        | n when n.StartsWith("Symbol.iterator", StringComparison.Ordinal) ->
-            let name = Identifier "__iter__"
-            Expression.name name
-        | n ->
-            let n = Naming.toPythonNaming n
+    let memberFromName
+        (_com: IPythonCompiler)
+        (_ctx: Context)
+        (memberName: string)
+        (_argCount: int option)
+        : Expression
+        =
+        // Name transformations for specific interfaces (Py.Map, etc.) should be handled
+        // in Replacements.fs, not here. This function just sanitizes the name.
+        let n = Naming.toPythonNaming memberName
 
-            (n, Naming.NoMemberPart)
-            ||> Naming.sanitizeIdent (fun _ -> false)
-            |> Expression.name
+        (n, Naming.NoMemberPart)
+        ||> Naming.sanitizeIdent (fun _ -> false)
+        |> Expression.name
 
     let get (com: IPythonCompiler) ctx _r left memberName subscript =
         // printfn "get: %A" (memberName, subscript)
@@ -441,7 +674,7 @@ module Util =
                 if l = "Any" then
                     com.GetImportExpr(ctx, "typing", "Any")
                 else
-                    libValue com ctx "types" l
+                    libValue com ctx "core" l
 
             let types_array = Expression.subscript (value = array, slice = type_obj, ctx = Load)
             Expression.call (types_array, [ expr ])
@@ -575,6 +808,7 @@ module Util =
         | Fable.String
         | Fable.Char -> Expression.stringConstant ""
         | Fable.DeclaredType(ent, _) -> Expression.none
+        | Fable.GenericParam _ -> libValue com ctx "util" "UNIT"
         | _ -> Expression.none
 
     /// Extract initialization value from constructor body by looking for backing field assignments
@@ -638,7 +872,7 @@ module Util =
             | [ _unit ], None when isOptional ->
                 { args with
                     Args = self :: args.Args
-                    Defaults = [ Expression.none ]
+                    Defaults = [ libValue com ctx "util" "UNIT" ]
                 }
             | _ -> { args with Args = self :: args.Args }
 
@@ -674,7 +908,7 @@ module Util =
         | Fable.DeclaredType(ent, [ Fable.DeclaredType(kvpEnt, [ _; _ ]) ]), Fable.DeclaredType(sourceEnt, _) when
             ent.FullName = Types.ienumerableGeneric
             && kvpEnt.FullName = Types.keyValuePair
-            && sourceEnt.FullName = Types.dictionary
+            && (sourceEnt.FullName = Types.dictionary || sourceEnt.FullName = Types.idictionary)
             ->
             Some(kvpEnt)
         | _ -> None
@@ -683,7 +917,7 @@ module Util =
         Expression.attribute (expr, Identifier field, ctx = Load), []
 
     let makeInteger (com: IPythonCompiler) (ctx: Context) r _t intName (x: obj) =
-        let cons = libValue com ctx "types" intName
+        let cons = libValue com ctx "core" intName
         let value = Expression.intConstant (x, ?loc = r)
 
         // Added support for a few selected literals for performance reasons
@@ -807,7 +1041,7 @@ module Util =
         | _ -> Expression.call (cons, [ value ], ?loc = r), []
 
     let makeFloat (com: IPythonCompiler) (ctx: Context) r _t floatName x =
-        let cons = libValue com ctx "types" floatName
+        let cons = libValue com ctx "core" floatName
         let value = Expression.floatConstant (x, ?loc = r)
         Expression.call (cons, [ value ], ?loc = r), []
 
@@ -1012,3 +1246,469 @@ module ExceptionHandling =
             specificHandlers, wildcardHandler
 
         | _ -> [], Some expr
+
+/// Utilities for Python match statement generation (PEP 634).
+/// These helpers transform F# decision trees into Python 3.10+ match/case statements.
+module MatchStatements =
+    open Fable.Transforms
+
+    /// Converts a Fable constant expression to a Python Pattern for match statements.
+    /// Returns None if the value cannot be converted to a pattern.
+    let fableValueToPattern (value: Fable.Expr) : Pattern option =
+        match value with
+        | Fable.Value(Fable.CharConstant c, _) -> Some(MatchValue(Expression.stringConstant (string<char> c)))
+        | Fable.Value(Fable.StringConstant s, _) -> Some(MatchValue(Expression.stringConstant s))
+        | Fable.Value(Fable.NumberConstant(v, _), _) ->
+            match v with
+            | Fable.NumberValue.Int8 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.UInt8 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.Int16 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.UInt16 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.Int32 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.UInt32 x -> Some(MatchValue(Expression.intConstant x))
+            | Fable.NumberValue.Float32 x -> Some(MatchValue(Expression.floatConstant (float x)))
+            | Fable.NumberValue.Float64 x -> Some(MatchValue(Expression.floatConstant x))
+            | _ -> None
+        | Fable.Value(Fable.BoolConstant b, _) -> Some(MatchSingleton(BoolLiteral b))
+        | Fable.Value(Fable.Null _, _) -> Some(MatchSingleton NoneLiteral)
+        | _ -> None
+
+    /// Active pattern to detect guard let bindings in F# pattern matching (debug mode).
+    /// Handles F# guards like `| n when n > 10 -> ...` which compile to:
+    ///   Let(n, IdentExpr(x), guardBody)
+    /// where guardBody uses n (e.g., n > 10)
+    /// Returns Some(subject, param, guardBody) if the pattern matches.
+    [<return: Struct>]
+    let (|GuardLetBinding|_|) =
+        function
+        | Fable.Let(param, Fable.IdentExpr subject, guardBody) -> ValueSome(subject, param, guardBody)
+        | _ -> ValueNone
+
+    /// Extracts the subject identifier from a binary comparison operation.
+    /// In release mode, guards like `n when n > 10` are inlined as direct comparisons.
+    /// Returns Some(subjectIdent) if we can identify the subject being compared.
+    let private tryExtractSubjectFromComparison (expr: Fable.Expr) : Fable.Ident option =
+        match expr with
+        | Fable.Operation(Fable.Binary(_, Fable.IdentExpr ident, _), _, _, _) -> Some ident
+        | Fable.Operation(Fable.Binary(_, _, Fable.IdentExpr ident), _, _, _) -> Some ident
+        | Fable.Operation(Fable.Logical(_, Fable.IdentExpr ident, _), _, _, _) -> Some ident
+        | Fable.Operation(Fable.Logical(_, _, Fable.IdentExpr ident), _, _, _) -> Some ident
+        | _ -> None
+
+    /// Simplified guard case representation for the new pattern.
+    /// (guardCondition, targetIndex, boundValues)
+    type InlinedGuardCase = Fable.Expr * int * Fable.Expr list
+
+    /// Extracts inlined guard cases from a decision tree (release mode).
+    /// In release mode, F# inlines the guard condition directly into the IfThenElse.
+    let private extractInlinedGuardCases
+        (subjectName: string option)
+        acc
+        expr
+        : (InlinedGuardCase list * (int * Fable.Expr list)) option
+        =
+        let rec loop subjectName acc expr =
+            match expr with
+            // Release mode pattern: condition is directly an Operation (comparison)
+            | Fable.IfThenElse(cond, Fable.DecisionTreeSuccess(targetIndex, boundValues, _), elseExpr, _) ->
+                match tryExtractSubjectFromComparison cond with
+                | Some subjectIdent ->
+                    // Verify the subject is the same across all cases
+                    match subjectName with
+                    | Some name when name <> subjectIdent.Name -> None
+                    | _ ->
+                        let guardCase: InlinedGuardCase = (cond, targetIndex, boundValues)
+                        loop (Some subjectIdent.Name) (guardCase :: acc) elseExpr
+                | None -> None
+            | Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, _) ->
+                // We've reached the default case
+                match subjectName with
+                | Some _ -> Some(List.rev acc, (defaultIndex, defaultBoundValues))
+                | None -> None
+            | _ ->
+                // Pattern doesn't match
+                None
+
+        loop subjectName acc expr
+
+    /// Extracts guard cases from a decision tree expression (debug mode).
+    /// Returns None if the pattern doesn't match a guard chain.
+    let private extractGuardCases (subjectName: string option) acc expr =
+        let rec loop subjectName acc expr =
+            match expr with
+            | Fable.IfThenElse(GuardLetBinding(subj, param, guardBody),
+                               Fable.DecisionTreeSuccess(targetIndex, boundValues, _),
+                               elseExpr,
+                               _) ->
+                // Verify the subject is the same across all cases
+                match subjectName with
+                | Some name when name <> subj.Name -> None // Different subjects, can't use match
+                | _ ->
+                    let guardCase = (subj, param, guardBody, targetIndex, boundValues)
+                    loop (Some subj.Name) (guardCase :: acc) elseExpr
+            | Fable.DecisionTreeSuccess(defaultIndex, defaultBoundValues, _) ->
+                // We've reached the default case
+                match subjectName with
+                | Some _ -> Some(List.rev acc, (defaultIndex, defaultBoundValues))
+                | None -> None
+            | _ ->
+                // Pattern doesn't match - not a pure guard chain
+                None
+
+        loop subjectName acc expr
+
+    /// Result type for guard pattern extraction - supports both debug and release mode patterns.
+    type GuardPatternResult =
+        /// Debug mode: Let bindings are present, we have subject, param, guardBody per case
+        | DebugModeGuards of
+            subjectIdent: Fable.Ident *
+            cases: (Fable.Ident * Fable.Ident * Fable.Expr * int * Fable.Expr list) list *
+            defaultCase: (int * Fable.Expr list)
+        /// Release mode: Guards are inlined, we have the guard condition directly
+        | ReleaseModeGuards of
+            subjectIdent: Fable.Ident *
+            cases: InlinedGuardCase list *
+            defaultCase: (int * Fable.Expr list)
+
+    /// Detects a chain of guard expressions in a decision tree.
+    /// Handles both debug mode (with Let bindings) and release mode (inlined guards).
+    /// Returns Some(GuardPatternResult) if the pattern matches.
+    let tryExtractGuardPattern treeExpr =
+        match treeExpr with
+        // Debug mode pattern: condition is a Let binding
+        | Fable.IfThenElse(GuardLetBinding(subject, param, guardBody),
+                           Fable.DecisionTreeSuccess(targetIndex, boundValues, _),
+                           elseExpr,
+                           _) ->
+            let firstCase = (subject, param, guardBody, targetIndex, boundValues)
+
+            match extractGuardCases (Some subject.Name) [ firstCase ] elseExpr with
+            | Some(cases, defaultCase) when List.length cases >= 1 ->
+                let subjectIdent = cases |> List.head |> (fun (s, _, _, _, _) -> s)
+                Some(DebugModeGuards(subjectIdent, cases, defaultCase))
+            | _ -> None
+
+        // Release mode pattern: condition is directly an Operation (comparison)
+        | Fable.IfThenElse(cond, Fable.DecisionTreeSuccess(targetIndex, boundValues, _), elseExpr, _) ->
+            match tryExtractSubjectFromComparison cond with
+            | Some subjectIdent ->
+                let firstCase: InlinedGuardCase = (cond, targetIndex, boundValues)
+
+                match extractInlinedGuardCases (Some subjectIdent.Name) [ firstCase ] elseExpr with
+                | Some(cases, defaultCase) when List.length cases >= 1 ->
+                    Some(ReleaseModeGuards(subjectIdent, cases, defaultCase))
+                | _ -> None
+            | None -> None
+
+        | _ -> None
+
+    /// Result type for tuple Option pattern extraction.
+    /// Represents patterns like: match (x, y) with | Some a, Some b -> ... | _ -> None
+    type TupleOptionPatternResult =
+        {
+            /// The variables being tested (e.g., [x; y])
+            TestedVars: Fable.Ident list
+            /// The target index for the success case (when all are Some)
+            SuccessTargetIndex: int
+            /// Bound values for the success case
+            SuccessBoundValues: Fable.Expr list
+            /// The target index for the None case (when any is None)
+            NoneTargetIndex: int
+        }
+
+    /// Extracts nested Option test patterns from a decision tree.
+    /// Detects patterns like: if x is Some then (if y is Some then success else none) else none
+    /// Returns Some result if the pattern matches, None otherwise.
+    let rec private extractNestedOptionTests
+        (noneTargetIdx: int option)
+        (testedVars: Fable.Ident list)
+        (expr: Fable.Expr)
+        : TupleOptionPatternResult option
+        =
+        match expr with
+        // Test for Some (isSome=true) with nested tests or success
+        | Fable.IfThenElse(Fable.Test(Fable.IdentExpr ident, Fable.OptionTest true, _), thenExpr, elseExpr, _) ->
+            // The else branch should go to a simple None target
+            match elseExpr with
+            | Fable.DecisionTreeSuccess(elseIdx, [], _) ->
+                // Check consistency with previously seen None target
+                match noneTargetIdx with
+                | Some idx when idx <> elseIdx -> None // Inconsistent None targets
+                | _ ->
+                    // Recurse into the then branch
+                    extractNestedOptionTests (Some elseIdx) (ident :: testedVars) thenExpr
+            | _ -> None // Else branch is not a simple target
+
+        // Success case - all Option tests passed
+        | Fable.DecisionTreeSuccess(successIdx, boundValues, _) ->
+            match noneTargetIdx with
+            | Some noneIdx when successIdx <> noneIdx ->
+                Some
+                    {
+                        TestedVars = List.rev testedVars
+                        SuccessTargetIndex = successIdx
+                        SuccessBoundValues = boundValues
+                        NoneTargetIndex = noneIdx
+                    }
+            | _ -> None // No None target found or success equals None target
+
+        | _ -> None
+
+    /// Tries to extract a tuple Option pattern from a decision tree.
+    /// Returns Some result if the tree matches the pattern, None otherwise.
+    /// Requires at least 2 tested variables to be a "tuple" pattern.
+    /// Single Option tests should use regular if/else to avoid nonlocal issues.
+    let tryExtractTupleOptionPattern (treeExpr: Fable.Expr) : TupleOptionPatternResult option =
+        match extractNestedOptionTests None [] treeExpr with
+        | Some result when List.length result.TestedVars >= 2 -> Some result
+        | _ -> None
+
+    /// A single case in a tuple boolean+guard pattern
+    type TupleBoolGuardCase =
+        {
+            /// The guard expression (e.g., i > 10), or None for literal/wildcard
+            GuardExpr: Fable.Expr option
+            /// Index of the element used in the guard (if any)
+            GuardIndex: int option
+            /// Target index for this case
+            TargetIndex: int
+            /// Bound values for this case
+            BoundValues: Fable.Expr list
+        }
+
+    /// Result type for tuple boolean+guard pattern extraction.
+    /// Represents patterns like: match tuple with | true, _, i when i > -1 -> ... | _ -> ...
+    type TupleBoolGuardPatternResult =
+        {
+            /// The tuple expression being matched
+            TupleExpr: Fable.Expr
+            /// The tuple type (to determine arity)
+            TupleType: Fable.Type
+            /// Index of the boolean element being tested (typically 0)
+            BoolIndex: int
+            /// The expected boolean value (true or false)
+            BoolValue: bool
+            /// List of guard cases (in order)
+            Cases: TupleBoolGuardCase list
+            /// Target index for default case
+            DefaultTargetIndex: int
+            /// Bound values for default case
+            DefaultBoundValues: Fable.Expr list
+        }
+
+    /// Extracts tuple index from a Get expression
+    [<return: Struct>]
+    let private (|TupleIndexGet|_|) =
+        function
+        | Fable.Get(expr, Fable.TupleIndex idx, _, _) -> ValueSome(expr, idx)
+        | _ -> ValueNone
+
+    /// Checks if two expressions refer to the same identifier
+    let private sameIdent expr1 expr2 =
+        match expr1, expr2 with
+        | Fable.IdentExpr id1, Fable.IdentExpr id2 -> id1.Name = id2.Name
+        | _ -> false
+
+    /// Extracts the tuple index from a comparison's left or right side
+    let private tryExtractGuardTupleIndex tupleExpr =
+        function
+        | Fable.Operation(Fable.Binary(_, TupleIndexGet(expr, idx), _), _, _, _) when sameIdent expr tupleExpr ->
+            Some idx
+        | Fable.Operation(Fable.Binary(_, _, TupleIndexGet(expr, idx)), _, _, _) when sameIdent expr tupleExpr ->
+            Some idx
+        | _ -> None
+
+    /// Tries to make a guard case from a guard expression
+    let private tryMakeGuardCase tupleExpr guardExpr targetIdx boundValues =
+        match tryExtractGuardTupleIndex tupleExpr guardExpr with
+        | Some guardIdx ->
+            Some
+                {
+                    GuardExpr = Some guardExpr
+                    GuardIndex = Some guardIdx
+                    TargetIndex = targetIdx
+                    BoundValues = boundValues
+                }
+        | None ->
+            // Try equality check pattern like tuple[2] == 0
+            match guardExpr with
+            | Fable.Operation(Fable.Binary(BinaryEqual, TupleIndexGet(expr, idx), _), _, _, _) when
+                sameIdent expr tupleExpr
+                ->
+                Some
+                    {
+                        GuardExpr = Some guardExpr
+                        GuardIndex = Some idx
+                        TargetIndex = targetIdx
+                        BoundValues = boundValues
+                    }
+            | _ -> None
+
+    /// Recursively extracts guard cases from nested IfThenElse
+    let rec private extractGuardCasesRec tupleExpr cases expr =
+        match expr with
+        | Fable.IfThenElse(guardExpr, Fable.DecisionTreeSuccess(targetIdx, boundValues, _), elseExpr, _) ->
+            match tryMakeGuardCase tupleExpr guardExpr targetIdx boundValues with
+            | Some guardCase ->
+                match elseExpr with
+                | Fable.DecisionTreeSuccess(elseTargetIdx, elseBoundValues, _) ->
+                    Some(List.rev (guardCase :: cases), elseTargetIdx, elseBoundValues)
+                | _ -> extractGuardCasesRec tupleExpr (guardCase :: cases) elseExpr
+            | None -> None
+        | Fable.DecisionTreeSuccess(targetIdx, boundValues, _) -> Some(List.rev cases, targetIdx, boundValues)
+        | _ -> None
+
+    /// Tries to extract a tuple boolean+guard pattern from a decision tree.
+    /// Detects: if tuple[0] then (chain of guards) else default
+    let tryExtractTupleBoolGuardPattern (treeExpr: Fable.Expr) : TupleBoolGuardPatternResult option =
+        match treeExpr with
+        | Fable.IfThenElse(TupleIndexGet(tupleExpr, boolIdx),
+                           innerExpr,
+                           Fable.DecisionTreeSuccess(outerDefaultIdx, outerDefaultBound, _),
+                           _) ->
+            match extractGuardCasesRec tupleExpr [] innerExpr with
+            | Some(cases, defaultIdx, defaultBound) when not (List.isEmpty cases) && defaultIdx = outerDefaultIdx ->
+                Some
+                    {
+                        TupleExpr = tupleExpr
+                        TupleType = tupleExpr.Type
+                        BoolIndex = boolIdx
+                        BoolValue = true
+                        Cases = cases
+                        DefaultTargetIndex = defaultIdx
+                        DefaultBoundValues = defaultBound
+                    }
+            | _ -> None
+        | _ -> None
+
+    /// Unwraps redundant Let bindings in the target expression.
+    /// The pattern already captures the value, so Let(v, x, body) where x is the subject
+    /// can be replaced with body (substituting v with patternIdent).
+    let rec unwrapRedundantLets (subjectName: string) (patternIdent: Fable.Ident) expr =
+        match expr with
+        | Fable.Let(ident, Fable.IdentExpr valueIdent, body) when valueIdent.Name = subjectName ->
+            // This Let binds a new variable to the subject - it's redundant
+            // Replace references to ident with patternIdent in the body
+            let body' =
+                FableTransforms.replaceValues (Map.ofList [ ident.Name, Fable.IdentExpr patternIdent ]) body
+
+            unwrapRedundantLets subjectName patternIdent body'
+        | _ -> expr
+
+    /// Represents a single case extracted from a decision tree for match statement generation.
+    /// Contains the accumulated condition, target index, and bound values.
+    type DecisionTreeCase =
+        {
+            /// The condition expression for this case (accumulated from IfThenElse chain)
+            Condition: Fable.Expr
+            /// Target index for this case
+            TargetIndex: int
+            /// Bound values for this case
+            BoundValues: Fable.Expr list
+        }
+
+    /// Result type for decision tree extraction for match statement conversion.
+    type DecisionTreeMatchResult =
+        {
+            /// All cases extracted from the decision tree
+            Cases: DecisionTreeCase list
+            /// Target index for the default case
+            DefaultTargetIndex: int
+            /// Bound values for the default case
+            DefaultBoundValues: Fable.Expr list
+        }
+
+    /// Extracts all cases from a decision tree for match statement generation.
+    /// Flattens nested IfThenElse into a list of (accumulated conditions, targetIndex, boundValues).
+    /// Each path from root to DecisionTreeSuccess becomes a case with ANDed conditions.
+    let tryExtractDecisionTreeCases (treeExpr: Fable.Expr) : DecisionTreeMatchResult option =
+        // Helper to AND two conditions together
+        let andConditions (c1: Fable.Expr) (c2: Fable.Expr) : Fable.Expr =
+            Fable.Operation(Fable.Logical(LogicalAnd, c1, c2), [], Fable.Boolean, None)
+
+        // Recursively extract all paths, accumulating conditions.
+        // Uses an accumulator (acc) to avoid O(n²) list concatenation.
+        // Cases are accumulated in reverse order and reversed at the end.
+        let rec extractPaths
+            (acc: DecisionTreeCase list)
+            (currentCondition: Fable.Expr option)
+            (expr: Fable.Expr)
+            : (DecisionTreeCase list * (int * Fable.Expr list) option) option
+            =
+            match expr with
+            | Fable.IfThenElse(condition, thenExpr, elseExpr, _) ->
+                // Condition for then branch: currentCondition AND condition
+                let thenCondition =
+                    match currentCondition with
+                    | Some cc -> andConditions cc condition
+                    | None -> condition
+
+                // For the else branch, we don't accumulate "NOT condition" because
+                // Python match semantics guarantee sequential evaluation with fall-through.
+                // If the then-branch guard fails, Python automatically tries the next case,
+                // so the negation is implicit. This produces cleaner guards like:
+                //   case _ if A: ...      (instead of case _ if A: ...)
+                //   case _ if B: ...      (instead of case _ if (not A) and B: ...)
+                //   case _: ...           (default)
+                let elseCondition = currentCondition
+
+                // Extract from then branch, passing accumulator
+                match extractPaths acc (Some thenCondition) thenExpr with
+                | Some(accAfterThen, thenDefault) ->
+                    // Extract from else branch, continuing with accumulated cases
+                    match extractPaths accAfterThen elseCondition elseExpr with
+                    | Some(accAfterElse, elseDefault) ->
+                        // Default should come from one of the branches (prefer else as it's typically the fallback)
+                        let defaultCase = elseDefault |> Option.orElse thenDefault
+                        Some(accAfterElse, defaultCase)
+                    | None -> None
+                | None -> None
+
+            | Fable.DecisionTreeSuccess(targetIndex, boundValues, _) ->
+                match currentCondition with
+                | Some cond ->
+                    // This is a case with accumulated conditions - prepend to accumulator
+                    let case =
+                        {
+                            Condition = cond
+                            TargetIndex = targetIndex
+                            BoundValues = boundValues
+                        }
+
+                    Some(case :: acc, None)
+                | None ->
+                    // This is the default case (no conditions accumulated)
+                    Some(acc, Some(targetIndex, boundValues))
+
+            | _ ->
+                // Pattern doesn't match expected structure
+                None
+
+        match extractPaths [] None treeExpr with
+        | Some(casesReversed, defaultOpt) ->
+            // Reverse the accumulated cases to restore original order
+            let cases = List.rev casesReversed
+
+            match defaultOpt with
+            | Some(defaultIndex, defaultBoundValues) when not (List.isEmpty cases) ->
+                Some
+                    {
+                        Cases = cases
+                        DefaultTargetIndex = defaultIndex
+                        DefaultBoundValues = defaultBoundValues
+                    }
+            | None ->
+                // No explicit default case found - the last case in the tree isn't
+                // necessarily a catch-all, so fall back to safer code generation
+                None
+            | Some(_defaultIndex, _defaultBoundValues) when List.isEmpty cases ->
+                // Only default case with no discriminating cases - a match statement
+                // would be trivially `case _:` with no discrimination, so fall back
+                // to simpler code generation
+                None
+            | _ ->
+                // Pattern doesn't match expected structure - fall back to other code generation
+                None
+        | None ->
+            // Pattern doesn't match expected structure - fall back to other code generation
+            None

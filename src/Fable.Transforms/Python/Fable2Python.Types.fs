@@ -5,8 +5,8 @@ open Fable.AST
 open Fable.Transforms.Python.AST
 
 type ReturnStrategy =
-    /// Return last expression
-    | Return
+    /// Return last expression with optional expected return type (for Option casting)
+    | Return of Fable.Type option
     | ReturnUnit
     /// Return within a with-statement (to make sure we don't TC with statements)
     | ResourceManager of ReturnStrategy option
@@ -123,6 +123,9 @@ type Context =
         ScopedTypeParams: Set<string>
         TypeParamsScope: int
         NarrowedTypes: Map<string, Fable.Type>
+        /// When inside a union base class definition, this holds the entity name.
+        /// Used to determine whether to use base class name or type alias for annotations.
+        EnclosingUnionBaseClass: string option
     }
 
 type IPythonCompiler =

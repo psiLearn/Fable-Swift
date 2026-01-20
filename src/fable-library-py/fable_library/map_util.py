@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, MutableMapping, MutableSet
 from enum import IntEnum
 from re import Match
 from typing import (
-    TYPE_CHECKING,
     Any,
     NoReturn,
     TypeVar,
+    cast,
 )
 
-from .types import FSharpRef, Union
-from .util import Array, ISet
+from .array_ import Array
+from .core import FSharpRef
+from .protocols import IEnumerable_1
+from .union import Union
+from .util import to_iterable
 
 
 _K = TypeVar("_K")
@@ -52,15 +55,7 @@ def change_case(string: str, case_rule: CaseRules) -> str:
     return string
 
 
-if TYPE_CHECKING:
-
-    class FSharpMap(dict[_K, _V]): ...
-
-else:
-    from .map import FSharpMap
-
-
-def add_to_set(v: object, st: ISet[object]) -> bool:
+def add_to_set(v: object, st: MutableSet[object]) -> bool:
     """Add to set-like object - returns True if added, False if already present."""
     if v in st:
         return False
@@ -76,7 +71,7 @@ def add_to_dict(di: dict[_K, _V], k: _K, v: _V) -> None:
     di[k] = v
 
 
-def remove_from_dict(di: dict[_K, Any], k: _K) -> bool:
+def remove_from_dict(di: MutableMapping[_K, Any], k: _K) -> bool:
     if k in di:
         del di[k]
         return True
@@ -84,7 +79,7 @@ def remove_from_dict(di: dict[_K, Any], k: _K) -> bool:
     return False
 
 
-def try_get_value(map: FSharpMap[_K, _V], key: _K, default_value: FSharpRef[_V]) -> bool:
+def try_get_value(map: Mapping[_K, _V], key: _K, default_value: FSharpRef[_V]) -> bool:
     if key in map.keys():
         default_value.contents = map[key]
         return True
@@ -92,15 +87,38 @@ def try_get_value(map: FSharpMap[_K, _V], key: _K, default_value: FSharpRef[_V])
     return False
 
 
-def get_item_from_dict(map: dict[_K, _V], key: _K) -> _V:
+def get_item_from_dict(map: Mapping[_K, _V], key: _K) -> _V:
     if key in map:
         return map[key]
     else:
         raise Exception(f"The given key '{key}' was not present in the dictionary.")
 
 
-def contains_value(v: _V, map: dict[Any, _V]) -> bool:
+def contains_value(v: _V, map: Mapping[Any, _V]) -> bool:
     return v in map.values()
+
+
+def make_dict[K, V](source: Mapping[K, V] | Iterable[tuple[K, V]] | IEnumerable_1[tuple[K, V]]) -> dict[K, V]:
+    """Convert a source to a Python dict.
+
+    Handles:
+    - dict objects (returns a copy)
+    - Mapping objects (converts to dict)
+    - Python iterables of (key, value) tuples
+    - Fable IEnumerable_1 objects (uses GetEnumerator)
+
+    Prefers Python protocols (more efficient), falls back to GetEnumerator.
+    """
+    # Fast path for dict
+    if isinstance(source, dict):
+        return dict(cast(dict[K, V], source))  # Return a copy
+
+    # Other Mapping types
+    if isinstance(source, Mapping):
+        return dict(cast(dict[K, V], source))  # Convert to dict
+
+    # Use to_iterable for both Python iterables and Fable IEnumerable_1
+    return dict(to_iterable(source))
 
 
 def key_value_list(fields: Iterable[Any], case_rule: CaseRules = CaseRules.Ignore):
