@@ -36,5 +36,8 @@
     "files.associations": {
         "*.jsx.actual": "javascript",
         "*.jsx.expected": "javascript"
+    },
+    "workbench.colorCustomizations": {
+        "statusBar.background": "#3c3ca9"
     }
 }

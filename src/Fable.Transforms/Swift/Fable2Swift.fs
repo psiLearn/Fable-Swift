@@ -28,10 +28,12 @@ let private unsupportedExprFallback =
 let private unsupportedBindingFallback =
     SwiftLiteral $"fatalError(\"{warningPrefix}: unsupported binding value\")"
 
-type private StderrAnalysis =
+type private HelperAnalysis =
     {
         NeedsStderrPrint: bool
         HasStderrHelper: bool
+        NeedsIsNullOrWhiteSpace: bool
+        HasIsNullOrWhiteSpaceHelper: bool
         HasFoundationImport: bool
         LastImportIndex: int option
     }
@@ -165,6 +167,8 @@ let private isSimplePrintfFormat (formatText: string) =
 let private stdoutPrintIdentifier = SwiftIdentifier "print"
 let private stderrPrintName = "stderrPrint"
 let private stderrPrintIdentifier = SwiftIdentifier stderrPrintName
+let private isNullOrWhiteSpaceName = "isNullOrWhiteSpace"
+let private isNullOrWhiteSpaceIdentifier = SwiftIdentifier isNullOrWhiteSpaceName
 
 let private tryGetPrintTarget name =
     match name with
@@ -213,9 +217,22 @@ let private tryGetConsoleTarget (info: ImportInfo) =
     else
         None
 
+let private isSystemStringMember memberName (callInfo: CallInfo) =
+    match callInfo.MemberRef with
+    | Some(MemberRef(declaringEntity, info)) ->
+        declaringEntity.FullName = "System.String" && info.CompiledName = memberName
+    | _ -> false
+
 let rec private tryTransformExpr =
     function
-    | Import(info, _, _) -> tryGetConsoleTarget info
+    | Import(info, _, _) ->
+        match tryGetConsoleTarget info with
+        | Some target -> Some target
+        | None ->
+            if String.IsNullOrWhiteSpace info.Selector then
+                None
+            else
+                SwiftIdentifier info.Selector |> Some
     | IdentExpr ident -> SwiftIdentifier ident.Name |> Some
     | Value(kind, _) -> tryTransformValue kind
     | TypeCast(expr, _) -> tryTransformExpr expr
@@ -243,30 +260,48 @@ let rec private tryTransformExpr =
             match kind with
             | FieldGet info -> SwiftMemberAccess(target, info.Name) |> Some
             | TupleIndex index -> SwiftMemberAccess(target, string index) |> Some
+            | ExprGet indexExpr ->
+                match tryTransformExpr indexExpr with
+                | Some index -> SwiftSubscript(target, index) |> Some
+                | None -> None
             | _ -> None
-    | Call(Import(info, _, _), callInfo, _, _) ->
+    | Call((Import(info, _, _) as importExpr), callInfo, _, _) ->
         match tryGetConsoleTarget info with
         | Some target -> tryTransformConsoleCall target callInfo.Args
-        | None -> None
-    | CurriedApply(Call(Import(info, _, _), callInfo, _, _), args, _, _) ->
-        match tryGetConsoleTarget info with
-        | Some target -> tryTransformConsoleCall target (callInfo.Args @ args)
-        | None -> None
-    | Call(callee, callInfo, _, _) ->
-        match tryGetCalleeName callee |> Option.bind tryGetPrintTarget with
-        | Some target -> tryTransformConsoleCall target callInfo.Args
-        | _ ->
-            let calleeExpr =
-                match callInfo.ThisArg, callee with
-                | Some thisArg, IdentExpr ident ->
-                    match tryTransformExpr thisArg with
-                    | Some target -> SwiftMemberAccess(target, ident.Name) |> Some
-                    | None -> None
-                | _ -> tryTransformExpr callee
-
-            match calleeExpr, tryTransformArgs callInfo.Args with
+        | None ->
+            match tryTransformExpr importExpr, tryTransformArgs callInfo.Args with
             | Some target, Some args -> SwiftCall(target, args) |> Some
             | _ -> None
+    | CurriedApply(Call((Import(info, _, _) as importExpr), callInfo, _, _), args, _, _) ->
+        match tryGetConsoleTarget info with
+        | Some target -> tryTransformConsoleCall target (callInfo.Args @ args)
+        | None ->
+            match tryTransformExpr importExpr, tryTransformArgs (callInfo.Args @ args) with
+            | Some target, Some args -> SwiftCall(target, args) |> Some
+            | _ -> None
+    | Call(callee, callInfo, _, _) ->
+        if isSystemStringMember "IsNullOrWhiteSpace" callInfo then
+            match callInfo.Args with
+            | [ arg ] ->
+                match tryTransformExpr arg with
+                | Some argExpr -> SwiftCall(isNullOrWhiteSpaceIdentifier, [ argExpr ]) |> Some
+                | None -> None
+            | _ -> None
+        else
+            match tryGetCalleeName callee |> Option.bind tryGetPrintTarget with
+            | Some target -> tryTransformConsoleCall target callInfo.Args
+            | _ ->
+                let calleeExpr =
+                    match callInfo.ThisArg, callee with
+                    | Some thisArg, IdentExpr ident ->
+                        match tryTransformExpr thisArg with
+                        | Some target -> SwiftMemberAccess(target, ident.Name) |> Some
+                        | None -> None
+                    | _ -> tryTransformExpr callee
+
+                match calleeExpr, tryTransformArgs callInfo.Args with
+                | Some target, Some args -> SwiftCall(target, args) |> Some
+                | _ -> None
     | CurriedApply(Call(callee, callInfo, callType, callRange), args, _, _) ->
         match tryGetCalleeName callee |> Option.bind tryGetPrintTarget with
         | Some target -> tryTransformConsoleCall target (callInfo.Args @ args)
@@ -369,6 +404,29 @@ let rec private transformExprAsStatements (com: Compiler) expr isTail =
             |> List.collect (fun (ident, value) -> transformBinding com ident value)
 
         bindingStatements @ transformExprAsStatements com body isTail
+    | DecisionTree(treeExpr, targets) ->
+        match tryTransformDecisionTreeAsStatements com targets treeExpr isTail with
+        | Some statements -> statements
+        | None ->
+            warnUnsupportedExpr com "decision tree" expr
+
+            if isTail && not (isUnitType expr.Type) then
+                [ unsupportedExprStatement; SwiftReturn(Some unsupportedExprFallback) ]
+            else
+                [ unsupportedExprStatement ]
+    | IfThenElse(guardExpr, thenExpr, elseExpr, _) ->
+        match tryTransformExpr guardExpr with
+        | Some guardSwift ->
+            let thenBlock = transformExprAsStatements com thenExpr isTail
+            let elseBlock = transformExprAsStatements com elseExpr isTail
+            [ SwiftIf(guardSwift, thenBlock, Some elseBlock) ]
+        | None ->
+            warnUnsupportedExpr com "if expression guard" guardExpr
+
+            if isTail && not (isUnitType expr.Type) then
+                [ unsupportedExprStatement; SwiftReturn(Some unsupportedExprFallback) ]
+            else
+                [ unsupportedExprStatement ]
     | Sequential exprs ->
         let lastIndex = List.length exprs - 1
 
@@ -392,6 +450,40 @@ let rec private transformExprAsStatements (com: Compiler) expr isTail =
                 [ unsupportedExprStatement; SwiftReturn(Some unsupportedExprFallback) ]
             else
                 [ unsupportedExprStatement ]
+
+and private tryTransformDecisionTreeAsStatements (com: Compiler) targets treeExpr isTail =
+    let rec build expr =
+        match expr with
+        | IfThenElse(condition, thenExpr, elseExpr, _) ->
+            match tryTransformExpr condition with
+            | None ->
+                warnUnsupportedExpr com "decision tree guard" condition
+                None
+            | Some guardExpr ->
+                match build thenExpr, build elseExpr with
+                | Some thenBlock, Some elseBlock -> Some [ SwiftIf(guardExpr, thenBlock, Some elseBlock) ]
+                | _ -> None
+        | DecisionTreeSuccess(targetIndex, boundValues, _) ->
+            tryTransformDecisionTreeSuccess com targets targetIndex boundValues isTail
+        | _ -> None
+
+    build treeExpr
+
+and private tryTransformDecisionTreeSuccess (com: Compiler) targets targetIndex boundValues isTail =
+    match targets |> List.tryItem targetIndex with
+    | None ->
+        addSwiftWarning com None $"decision tree target {targetIndex} not found."
+        None
+    | Some(idents, targetExpr) ->
+        if idents.Length <> boundValues.Length then
+            addSwiftWarning com targetExpr.Range "decision tree target bindings mismatch."
+            None
+        else
+            let bindings =
+                List.zip idents boundValues
+                |> List.collect (fun (ident, value) -> transformBinding com ident value)
+
+            Some(bindings @ transformExprAsStatements com targetExpr isTail)
 
 let private transformMemberDecl (com: Compiler) (decl: MemberDecl) =
     let parameters =
@@ -455,38 +547,54 @@ module Compiler =
     let transformFile (com: Compiler) (file: File) : SwiftFile =
         let declarations = file.Declarations |> List.collect (transformDeclaration com)
 
-        let rec exprUsesStderrPrint =
+        let rec exprUsesCall name =
             function
             | SwiftCall(callee, args) ->
                 match callee with
-                | SwiftIdentifier name when name = stderrPrintName -> true
-                | _ -> exprUsesStderrPrint callee || (args |> List.exists exprUsesStderrPrint)
-            | SwiftMemberAccess(expr, _) -> exprUsesStderrPrint expr
+                | SwiftIdentifier calleeName when calleeName = name -> true
+                | _ -> exprUsesCall name callee || (args |> List.exists (exprUsesCall name))
+            | SwiftBinary(left, _, right) -> exprUsesCall name left || exprUsesCall name right
+            | SwiftMemberAccess(expr, _) -> exprUsesCall name expr
+            | SwiftSubscript(expr, index) -> exprUsesCall name expr || exprUsesCall name index
             | _ -> false
 
-        let rec statementUsesStderrPrint =
+        let rec statementUsesCall name =
             function
-            | SwiftExpr expr -> exprUsesStderrPrint expr
-            | SwiftReturn(Some expr) -> exprUsesStderrPrint expr
+            | SwiftExpr expr -> exprUsesCall name expr
+            | SwiftReturn(Some expr) -> exprUsesCall name expr
             | SwiftReturn None -> false
-            | SwiftBindingStatement binding -> binding.Expr |> Option.exists exprUsesStderrPrint
-            | SwiftBlock statements -> statements |> List.exists statementUsesStderrPrint
+            | SwiftBindingStatement binding -> binding.Expr |> Option.exists (exprUsesCall name)
+            | SwiftIf(condition, thenBlock, elseBlock) ->
+                exprUsesCall name condition
+                || (thenBlock |> List.exists (statementUsesCall name))
+                || (elseBlock |> Option.exists (List.exists (statementUsesCall name)))
+            | SwiftBlock statements -> statements |> List.exists (statementUsesCall name)
 
-        let declarationUsesStderrPrint =
+        let declarationUsesCall name =
             function
-            | SwiftBinding binding -> binding.Expr |> Option.exists exprUsesStderrPrint
-            | SwiftStatementDecl stmt -> statementUsesStderrPrint stmt
-            | SwiftFuncDecl funcDecl -> funcDecl.Body |> List.exists statementUsesStderrPrint
+            | SwiftBinding binding -> binding.Expr |> Option.exists (exprUsesCall name)
+            | SwiftStatementDecl stmt -> statementUsesCall name stmt
+            | SwiftFuncDecl funcDecl -> funcDecl.Body |> List.exists (statementUsesCall name)
             | _ -> false
 
         let analyzeDeclaration index analysis declaration =
             let needsStderrPrint =
-                analysis.NeedsStderrPrint || declarationUsesStderrPrint declaration
+                analysis.NeedsStderrPrint || declarationUsesCall stderrPrintName declaration
+
+            let needsIsNullOrWhiteSpace =
+                analysis.NeedsIsNullOrWhiteSpace
+                || declarationUsesCall isNullOrWhiteSpaceName declaration
 
             let hasStderrHelper =
                 analysis.HasStderrHelper
                 || match declaration with
                    | SwiftFuncDecl funcDecl when funcDecl.Name = stderrPrintName -> true
+                   | _ -> false
+
+            let hasIsNullOrWhiteSpaceHelper =
+                analysis.HasIsNullOrWhiteSpaceHelper
+                || match declaration with
+                   | SwiftFuncDecl funcDecl when funcDecl.Name = isNullOrWhiteSpaceName -> true
                    | _ -> false
 
             let hasFoundationImport =
@@ -503,6 +611,8 @@ module Compiler =
             {
                 NeedsStderrPrint = needsStderrPrint
                 HasStderrHelper = hasStderrHelper
+                NeedsIsNullOrWhiteSpace = needsIsNullOrWhiteSpace
+                HasIsNullOrWhiteSpaceHelper = hasIsNullOrWhiteSpaceHelper
                 HasFoundationImport = hasFoundationImport
                 LastImportIndex = lastImportIndex
             }
@@ -515,40 +625,68 @@ module Compiler =
                 {
                     NeedsStderrPrint = false
                     HasStderrHelper = false
+                    NeedsIsNullOrWhiteSpace = false
+                    HasIsNullOrWhiteSpaceHelper = false
                     HasFoundationImport = false
                     LastImportIndex = None
                 }
 
+        let stderrHelperDecl =
+            let helperBody =
+                [
+                    SwiftExpr(
+                        SwiftLiteral "FileHandle.standardError.write(Data((String(describing: value) + \"\\n\").utf8))"
+                    )
+                ]
+
+            SwiftFuncDecl
+                {
+                    Name = stderrPrintName
+                    Parameters = [ "_ value: Any" ]
+                    Body = helperBody
+                }
+
+        let isNullOrWhiteSpaceDecl =
+            let helperBody =
+                [
+                    SwiftReturn(
+                        Some(SwiftLiteral "value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true")
+                    )
+                ]
+
+            SwiftFuncDecl
+                {
+                    Name = isNullOrWhiteSpaceName
+                    Parameters = [ "_ value: String?" ]
+                    Body = helperBody
+                }
+
+        let helperDecls =
+            [
+                if analysis.NeedsStderrPrint && not analysis.HasStderrHelper then
+                    stderrHelperDecl
+                if analysis.NeedsIsNullOrWhiteSpace && not analysis.HasIsNullOrWhiteSpaceHelper then
+                    isNullOrWhiteSpaceDecl
+            ]
+
+        let needsFoundation =
+            (analysis.NeedsStderrPrint && not analysis.HasStderrHelper)
+            || (analysis.NeedsIsNullOrWhiteSpace && not analysis.HasIsNullOrWhiteSpaceHelper)
+
+        let helperImports =
+            if needsFoundation && not analysis.HasFoundationImport then
+                [ SwiftImport { Module = "Foundation" } ]
+            else
+                []
+
         let declarations =
-            if analysis.NeedsStderrPrint && not analysis.HasStderrHelper then
-                let helperBody =
-                    [
-                        SwiftExpr(
-                            SwiftLiteral
-                                "FileHandle.standardError.write(Data((String(describing: value) + \"\\n\").utf8))"
-                        )
-                    ]
-
-                let helperDecl =
-                    SwiftFuncDecl
-                        {
-                            Name = stderrPrintName
-                            Parameters = [ "_ value: Any" ]
-                            Body = helperBody
-                        }
-
-                let helperImports =
-                    if analysis.HasFoundationImport then
-                        []
-                    else
-                        [ SwiftImport { Module = "Foundation" } ]
-
+            if List.isEmpty helperDecls then
+                declarations
+            else
                 match analysis.LastImportIndex with
                 | Some lastIndex ->
                     let prefix, suffix = declarations |> List.splitAt (lastIndex + 1)
-                    prefix @ helperImports @ (helperDecl :: suffix)
-                | None -> helperImports @ (helperDecl :: declarations)
-            else
-                declarations
+                    prefix @ helperImports @ helperDecls @ suffix
+                | None -> helperImports @ helperDecls @ declarations
 
         { Declarations = declarations }

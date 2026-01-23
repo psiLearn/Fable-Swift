@@ -74,6 +74,19 @@ let rec private renderExpression =
             ""
         else
             $"{target}.{memberText}"
+    | SwiftSubscript(expr, indexExpr) ->
+        let target = renderExpression expr
+        let indexText = renderExpression indexExpr
+
+        if String.IsNullOrWhiteSpace(target) || String.IsNullOrWhiteSpace(indexText) then
+            ""
+        else
+            let renderedTarget =
+                match expr with
+                | SwiftBinary _ -> $"({target})"
+                | _ -> target
+
+            $"{renderedTarget}[{indexText}]"
     | SwiftCall(callee, args) ->
         let renderedCallee = renderExpression callee
 
@@ -125,6 +138,40 @@ let rec private renderStatement (indent: string) =
         | Some rendered when String.IsNullOrWhiteSpace(rendered) -> indent + "return /* invalid expression */"
         | Some rendered -> indent + "return " + rendered
     | SwiftBindingStatement bindingDecl -> renderBindingDecl indent bindingDecl
+    | SwiftIf(condition, thenStatements, elseStatements) ->
+        let conditionText = renderExpression condition
+
+        if String.IsNullOrWhiteSpace(conditionText) then
+            ""
+        else
+            let renderInlineBlock statements =
+                let innerIndent = indent + indentStep
+                let nl = Environment.NewLine
+
+                let inner =
+                    statements
+                    |> List.map (renderStatement innerIndent)
+                    |> List.filter (fun line -> not (String.IsNullOrWhiteSpace line))
+                    |> String.concat nl
+
+                let openBrace = "{"
+                let closeBrace = indent + "}"
+
+                if String.IsNullOrWhiteSpace(inner) then
+                    String.concat nl [ openBrace; closeBrace ]
+                else
+                    String.concat nl [ openBrace; inner; closeBrace ]
+
+            let thenBlock = renderInlineBlock thenStatements
+
+            match elseStatements with
+            | None -> indent + $"if {conditionText} " + thenBlock
+            | Some elseBlock ->
+                indent
+                + $"if {conditionText} "
+                + thenBlock
+                + " else "
+                + renderInlineBlock elseBlock
     | SwiftBlock statements ->
         let innerIndent = indent + indentStep
         let nl = Environment.NewLine

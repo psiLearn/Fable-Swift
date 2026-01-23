@@ -8,7 +8,8 @@
 
 ## Next steps for alignment
 
+- [x] Add Swift `if`/`else` statements and subscripts to cover basic control flow and indexing.
 - [ ] Add Swift replacements in `Replacements.fs` to mirror core mappings used by other backends.
-- [ ] Expand Swift AST/printer coverage for control flow, basic expressions, and collections.
+- [ ] Expand Swift AST/printer coverage for additional control flow (switch/loops) and collection literals.
 - [ ] Introduce a minimal Swift runtime library and wire it through import paths.
-- [ ] Add integration tests for Swift transform semantics beyond printer output.
+- [x] Add integration tests for Swift transform semantics beyond printer output.

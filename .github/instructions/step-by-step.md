@@ -37,7 +37,11 @@ Implement the requested feature/change described below, but do it in tiny, safe,
      - test quality: missing assertions, flaky tests, no coverage for edge cases
    - If you make improvements that change code, you MUST go back to step (2) and rebuild + rerun tests.
 
-5) Finalize with a git commit (ONLY when fully successful)
+5) Update documentation and README
+   - After code changes are stable and tests pass, update relevant docs and README to reflect new behavior, usage, or configuration.
+   - If no documentation changes are needed, state why.
+
+6) Finalize with a git commit (ONLY when fully successful)
    - When the feature/change is complete AND:
      - build is green
      - tests are green
@@ -77,7 +81,3 @@ For the final step, also include:
 - Don’t introduce new dependencies unless required; if required, justify and keep it minimal.
 - Prefer existing patterns in the repo (architecture, naming, testing conventions).
 - Do not refactor unrelated code “just because”; only refactor when it removes warnings, reduces risk, or is required for the feature.
-
-## Feature / change request
-
-<Describe here what you want implemented. Include acceptance criteria, expected behavior, and any constraints.>

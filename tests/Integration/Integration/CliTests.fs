@@ -534,6 +534,59 @@ let tests =
 
         Expect.equal written expected "escapes quotes and backslashes"
 
+    testCase "Swift printer formats if statements" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftStatementDecl(
+                            SwiftIf(
+                                SwiftBinary(SwiftIdentifier "count", SwiftGreater, SwiftLiteral "0"),
+                                [ SwiftExpr(SwiftIdentifier "run()") ],
+                                Some [ SwiftExpr(SwiftIdentifier "fallback()") ]
+                            )
+                        )
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat
+                Environment.NewLine
+                [ "if count > 0 {"; "    run()"; "} else {"; "    fallback()"; "}"; "" ]
+
+        Expect.equal written expected "renders if/else blocks"
+
+    testCase "Swift printer wraps binary subscript targets" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftStatementDecl(
+                            SwiftExpr(
+                                SwiftSubscript(
+                                    SwiftBinary(SwiftIdentifier "left", SwiftGreater, SwiftIdentifier "right"),
+                                    SwiftLiteral "0"
+                                )
+                            )
+                        )
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected =
+            String.concat Environment.NewLine [ "(left > right)[0]"; "" ]
+
+        Expect.equal written expected "wraps binary targets in parentheses"
+
     testCase "Swift transform uses bindings for zero-arg members" <| fun () ->
         let com = makeCompiler Swift "lib"
 
@@ -572,6 +625,181 @@ let tests =
         | declarations ->
             failtestf "Expected single SwiftBinding, got %A" declarations
 
+    testCase "Swift transform emits if statements for decision trees" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let numberType =
+            Fable.AST.Fable.Number(Fable.AST.NumberKind.Int32, Fable.AST.Fable.NumberInfo.Empty)
+
+        let guardExpr =
+            Fable.AST.Fable.Value(Fable.AST.Fable.BoolConstant true, None)
+
+        let treeExpr =
+            Fable.AST.Fable.IfThenElse(
+                guardExpr,
+                Fable.AST.Fable.DecisionTreeSuccess(0, [], numberType),
+                Fable.AST.Fable.DecisionTreeSuccess(1, [], numberType),
+                None
+            )
+
+        let one =
+            Fable.AST.Fable.Value(
+                Fable.AST.Fable.NumberConstant(
+                    Fable.AST.Fable.NumberValue.Int32 1,
+                    Fable.AST.Fable.NumberInfo.Empty
+                ),
+                None
+            )
+
+        let zero =
+            Fable.AST.Fable.Value(
+                Fable.AST.Fable.NumberConstant(
+                    Fable.AST.Fable.NumberValue.Int32 0,
+                    Fable.AST.Fable.NumberInfo.Empty
+                ),
+                None
+            )
+
+        let expr = Fable.AST.Fable.DecisionTree(treeExpr, [ ([], one); ([], zero) ])
+
+        let arg: Fable.AST.Fable.Ident =
+            {
+                Name = "value"
+                Type = numberType
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let memberRef =
+            Fable.AST.Fable.GeneratedMember.Function("choose", [ numberType ], numberType, isInstance = false)
+
+        let decl: Fable.AST.Fable.MemberDecl =
+            {
+                Name = "choose"
+                Args = [ arg ]
+                Body = expr
+                MemberRef = memberRef
+                IsMangled = false
+                ImplementedSignatureRef = None
+                UsedNames = Set.empty
+                XmlDoc = None
+                Tags = []
+            }
+
+        let file = Fable.AST.Fable.File([ Fable.AST.Fable.MemberDeclaration decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | [ SwiftFuncDecl funcDecl ] ->
+            match funcDecl.Body with
+            | [ SwiftIf(condition, thenBlock, Some elseBlock) ] ->
+                Expect.equal condition (SwiftLiteral "true") "condition expression"
+                Expect.equal thenBlock [ SwiftReturn(Some(SwiftLiteral "1")) ] "then branch returns 1"
+                Expect.equal elseBlock [ SwiftReturn(Some(SwiftLiteral "0")) ] "else branch returns 0"
+            | body ->
+                failtestf "Expected SwiftIf body, got %A" body
+        | declarations ->
+            failtestf "Expected SwiftFuncDecl, got %A" declarations
+
+    testCase "Swift transform preserves decision tree guard nesting" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let numberType =
+            Fable.AST.Fable.Number(Fable.AST.NumberKind.Int32, Fable.AST.Fable.NumberInfo.Empty)
+
+        let guard1 =
+            Fable.AST.Fable.Value(Fable.AST.Fable.BoolConstant true, None)
+
+        let guard2 =
+            Fable.AST.Fable.Value(Fable.AST.Fable.BoolConstant false, None)
+
+        let treeExpr =
+            Fable.AST.Fable.IfThenElse(
+                guard1,
+                Fable.AST.Fable.IfThenElse(
+                    guard2,
+                    Fable.AST.Fable.DecisionTreeSuccess(0, [], numberType),
+                    Fable.AST.Fable.DecisionTreeSuccess(1, [], numberType),
+                    None
+                ),
+                Fable.AST.Fable.DecisionTreeSuccess(2, [], numberType),
+                None
+            )
+
+        let one =
+            Fable.AST.Fable.Value(
+                Fable.AST.Fable.NumberConstant(
+                    Fable.AST.Fable.NumberValue.Int32 1,
+                    Fable.AST.Fable.NumberInfo.Empty
+                ),
+                None
+            )
+
+        let two =
+            Fable.AST.Fable.Value(
+                Fable.AST.Fable.NumberConstant(
+                    Fable.AST.Fable.NumberValue.Int32 2,
+                    Fable.AST.Fable.NumberInfo.Empty
+                ),
+                None
+            )
+
+        let three =
+            Fable.AST.Fable.Value(
+                Fable.AST.Fable.NumberConstant(
+                    Fable.AST.Fable.NumberValue.Int32 3,
+                    Fable.AST.Fable.NumberInfo.Empty
+                ),
+                None
+            )
+
+        let expr = Fable.AST.Fable.DecisionTree(treeExpr, [ ([], one); ([], two); ([], three) ])
+
+        let arg: Fable.AST.Fable.Ident =
+            {
+                Name = "value"
+                Type = numberType
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let memberRef =
+            Fable.AST.Fable.GeneratedMember.Function("chooseNested", [ numberType ], numberType, isInstance = false)
+
+        let decl: Fable.AST.Fable.MemberDecl =
+            {
+                Name = "chooseNested"
+                Args = [ arg ]
+                Body = expr
+                MemberRef = memberRef
+                IsMangled = false
+                ImplementedSignatureRef = None
+                UsedNames = Set.empty
+                XmlDoc = None
+                Tags = []
+            }
+
+        let file = Fable.AST.Fable.File([ Fable.AST.Fable.MemberDeclaration decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | [ SwiftFuncDecl funcDecl ] ->
+            match funcDecl.Body with
+            | [ SwiftIf(outerCondition, [ SwiftIf(innerCondition, thenBlock, Some elseBlockInner) ], Some elseBlockOuter) ] ->
+                Expect.equal outerCondition (SwiftLiteral "true") "outer condition"
+                Expect.equal innerCondition (SwiftLiteral "false") "inner condition"
+                Expect.equal thenBlock [ SwiftReturn(Some(SwiftLiteral "1")) ] "then branch returns 1"
+                Expect.equal elseBlockInner [ SwiftReturn(Some(SwiftLiteral "2")) ] "else branch returns 2"
+                Expect.equal elseBlockOuter [ SwiftReturn(Some(SwiftLiteral "3")) ] "outer else returns 3"
+            | body ->
+                failtestf "Expected nested SwiftIf body, got %A" body
+        | declarations ->
+            failtestf "Expected SwiftFuncDecl, got %A" declarations
+
     testCase "Swift transform maps toConsoleError to stderrPrint" <| fun () ->
         let com = makeCompiler Swift "lib"
 
@@ -604,4 +832,158 @@ let tests =
             Expect.equal name "stderrPrint" "uses stderrPrint call"
         | declarations ->
             failtestf "Expected stderrPrint helper and call, got %A" declarations
+
+    testCase "Swift transform maps System.String.IsNullOrWhiteSpace to helper" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let stringEntity: Fable.AST.Fable.EntityRef =
+            {
+                FullName = "System.String"
+                Path = Fable.AST.Fable.CoreAssemblyName "System.Runtime"
+            }
+
+        let memberInfo: Fable.AST.Fable.MemberRefInfo =
+            {
+                IsInstance = false
+                CompiledName = "IsNullOrWhiteSpace"
+                NonCurriedArgTypes = None
+                AttributeFullNames = []
+            }
+
+        let memberRef = Fable.AST.Fable.MemberRef(stringEntity, memberInfo)
+
+        let arg: Fable.AST.Fable.Ident =
+            {
+                Name = "value"
+                Type = Fable.AST.Fable.String
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let callInfo =
+            Fable.AST.Fable.CallInfo.Create(
+                args = [ Fable.AST.Fable.IdentExpr arg ],
+                memberRef = memberRef
+            )
+
+        let calleeIdent: Fable.AST.Fable.Ident =
+            {
+                Name = "IsNullOrWhiteSpace"
+                Type = Fable.AST.Fable.Boolean
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let expr = Fable.AST.Fable.Call(Fable.AST.Fable.IdentExpr calleeIdent, callInfo, Fable.AST.Fable.Boolean, None)
+
+        let decl =
+            Fable.AST.Fable.ActionDeclaration
+                {
+                    Body = expr
+                    UsedNames = Set.empty
+                }
+
+        let file = Fable.AST.Fable.File([ decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | SwiftImport importDecl
+            :: SwiftFuncDecl funcDecl
+            :: SwiftStatementDecl (SwiftExpr (SwiftCall(SwiftIdentifier name, _)))
+            :: _ ->
+            Expect.equal importDecl.Module "Foundation" "adds Foundation import"
+            Expect.equal funcDecl.Name "isNullOrWhiteSpace" "adds isNullOrWhiteSpace helper"
+            Expect.equal name "isNullOrWhiteSpace" "uses isNullOrWhiteSpace call"
+        | declarations ->
+            failtestf "Expected isNullOrWhiteSpace helper and call, got %A" declarations
+
+    testCase "Swift transform keeps helpers for binary expressions" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let stringEntity: Fable.AST.Fable.EntityRef =
+            {
+                FullName = "System.String"
+                Path = Fable.AST.Fable.CoreAssemblyName "System.Runtime"
+            }
+
+        let memberInfo: Fable.AST.Fable.MemberRefInfo =
+            {
+                IsInstance = false
+                CompiledName = "IsNullOrWhiteSpace"
+                NonCurriedArgTypes = None
+                AttributeFullNames = []
+            }
+
+        let memberRef = Fable.AST.Fable.MemberRef(stringEntity, memberInfo)
+
+        let arg: Fable.AST.Fable.Ident =
+            {
+                Name = "value"
+                Type = Fable.AST.Fable.String
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let callInfo =
+            Fable.AST.Fable.CallInfo.Create(
+                args = [ Fable.AST.Fable.IdentExpr arg ],
+                memberRef = memberRef
+            )
+
+        let calleeIdent: Fable.AST.Fable.Ident =
+            {
+                Name = "IsNullOrWhiteSpace"
+                Type = Fable.AST.Fable.Boolean
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let callExpr =
+            Fable.AST.Fable.Call(
+                Fable.AST.Fable.IdentExpr calleeIdent,
+                callInfo,
+                Fable.AST.Fable.Boolean,
+                None
+            )
+
+        let expr =
+            Fable.AST.Fable.Operation(
+                Fable.AST.Fable.Logical(
+                    Fable.AST.Fable.LogicalAnd,
+                    callExpr,
+                    Fable.AST.Fable.Value(Fable.AST.Fable.BoolConstant true, None)
+                ),
+                [],
+                Fable.AST.Fable.Boolean,
+                None
+            )
+
+        let decl =
+            Fable.AST.Fable.ActionDeclaration
+                {
+                    Body = expr
+                    UsedNames = Set.empty
+                }
+
+        let file = Fable.AST.Fable.File([ decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | SwiftImport importDecl
+            :: SwiftFuncDecl funcDecl
+            :: SwiftStatementDecl (SwiftExpr (SwiftBinary(SwiftCall(SwiftIdentifier name, _), SwiftLogicalAnd, _)))
+            :: _ ->
+            Expect.equal importDecl.Module "Foundation" "adds Foundation import"
+            Expect.equal funcDecl.Name "isNullOrWhiteSpace" "adds isNullOrWhiteSpace helper"
+            Expect.equal name "isNullOrWhiteSpace" "uses isNullOrWhiteSpace call"
+        | declarations ->
+            failtestf "Expected isNullOrWhiteSpace helper in binary expr, got %A" declarations
   ]

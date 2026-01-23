@@ -16,6 +16,7 @@ type SwiftExpression =
     | SwiftLiteral of string
     | SwiftStringLiteral of string
     | SwiftMemberAccess of SwiftExpression * string
+    | SwiftSubscript of SwiftExpression * SwiftExpression
     | SwiftBinary of SwiftExpression * SwiftBinaryOperator * SwiftExpression
     | SwiftCall of SwiftExpression * SwiftExpression list
 
@@ -42,6 +43,7 @@ type SwiftStatement =
     | SwiftBlock of SwiftBlock
     | SwiftReturn of SwiftExpression option
     | SwiftBindingStatement of SwiftBindingDecl
+    | SwiftIf of SwiftExpression * SwiftBlock * SwiftBlock option
 
 type SwiftDeclaration =
     | SwiftComment of string
