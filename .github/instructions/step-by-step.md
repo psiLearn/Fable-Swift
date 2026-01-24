@@ -24,6 +24,7 @@ Implement the requested feature/change described below, but do it in tiny, safe,
    - After each incremental change, you MUST run:
      a) the build/compile command
      b) the test command (unit tests at minimum; include integration tests if they are part of the standard suite)
+     c) any Husky tasks/hooks for the files you changed; follow any instructions they emit
    - If you are unsure which commands to run, inspect existing repo docs/config (README, package.json scripts, Makefile, CI yaml, etc.) and choose the same commands used in CI.
 
 3) Fix failures/warnings immediately
