@@ -561,6 +561,28 @@ let tests =
 
         Expect.equal written expected "renders if/else blocks"
 
+    testCase "Swift printer formats assignment expressions" <| fun () ->
+        let mutable written = ""
+        let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer
+
+        let file =
+            {
+                Declarations =
+                    [
+                        SwiftStatementDecl(
+                            SwiftExpr(
+                                SwiftBinary(SwiftIdentifier "value", SwiftAssign, SwiftLiteral "42")
+                            )
+                        )
+                    ]
+            }
+
+        SwiftPrinter.run capture file |> Async.RunSynchronously
+
+        let expected = String.concat Environment.NewLine [ "value = 42"; "" ]
+
+        Expect.equal written expected "renders assignments"
+
     testCase "Swift printer wraps binary subscript targets" <| fun () ->
         let mutable written = ""
         let capture = new InMemoryWriter(fun str -> written <- str) :> Printer.Writer

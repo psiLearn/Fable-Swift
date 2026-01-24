@@ -50,6 +50,7 @@ let rec private renderExpression =
             | SwiftGreaterOrEqual -> ">="
             | SwiftLogicalOr -> "||"
             | SwiftLogicalAnd -> "&&"
+            | SwiftAssign -> "="
 
         let wrapIfBinary expr text =
             match expr with

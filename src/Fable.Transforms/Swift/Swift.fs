@@ -10,6 +10,7 @@ type SwiftBinaryOperator =
     | SwiftGreaterOrEqual
     | SwiftLogicalOr
     | SwiftLogicalAnd
+    | SwiftAssign
 
 type SwiftExpression =
     | SwiftIdentifier of string
