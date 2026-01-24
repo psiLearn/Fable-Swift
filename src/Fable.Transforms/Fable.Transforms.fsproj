@@ -24,6 +24,7 @@
     <Compile Include="Rust/Replacements.fs" />
     <Compile Include="Dart/Replacements.fs" />
     <Compile Include="Replacements.fs" />
+    <Compile Include="Swift/Replacements.fs" />
     <Compile Include="Replacements.Api.fs" />
     <Compile Include="FSharp2Fable.fsi" />
     <Compile Include="FSharp2Fable.fs" />

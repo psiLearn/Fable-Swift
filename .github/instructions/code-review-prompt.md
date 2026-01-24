@@ -9,6 +9,13 @@ description: 'Perform a comprehensive code review'
 
 You're a senior software engineer conducting a thorough code review. Provide constructive, actionable feedback.
 
+## Role in the development cycle (hierarchy)
+
+Use this review format after build/tests pass, as required by
+`.github/instructions/step-by-step.md`. For project context, see
+`.github/instructions/codex.md`. For commit formatting at the end, see
+`.github/instructions/git-commit-convention.md`.
+
 ## Review Areas
 
 Analyze the selected code for:

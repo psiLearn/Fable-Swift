@@ -67,7 +67,15 @@ module private MSBuildCrackerResolver =
             let fullCommand = $"dotnet %s{psi.Arguments}"
 
             if not (String.IsNullOrWhiteSpace error) then
-                failwithf $"In %s{psi.WorkingDirectory}:\n%s{fullCommand}\nfailed with\n%s{error}"
+                let errorLines =
+                    error.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.filter (fun line ->
+                        not (line.Contains("warning NU1900", StringComparison.OrdinalIgnoreCase))
+                    )
+
+                if not (Array.isEmpty errorLines) then
+                    let filteredError = String.Join(Environment.NewLine, errorLines)
+                    failwithf $"In %s{psi.WorkingDirectory}:\n%s{fullCommand}\nfailed with\n%s{filteredError}"
 
             return output.Trim()
         }

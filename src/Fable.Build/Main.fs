@@ -1,6 +1,7 @@
 module Build.Main
 
 open Build.FableLibrary
+open System
 
 // This is a basic help message, as the CLI parser is not a "real" CLI parser
 // For now, it is enough as this is just a dev tool
@@ -114,8 +115,20 @@ Available commands:
 let main argv =
     let argv = argv |> Array.map (fun x -> x.ToLower()) |> Array.toList
 
+    let skipHusky =
+        match Environment.GetEnvironmentVariable("HUSKY") with
+        | null
+        | "" -> false
+        | value ->
+            match value.Trim().ToLowerInvariant() with
+            | "0"
+            | "false" -> true
+            | _ -> false
+
     SimpleExec.Command.Run(name = "dotnet", args = "tool restore")
-    SimpleExec.Command.Run(name = "dotnet", args = "husky install --allow-roll-forward")
+
+    if not skipHusky then
+        SimpleExec.Command.Run(name = "dotnet", args = "husky install --allow-roll-forward")
 
     try
         match argv with

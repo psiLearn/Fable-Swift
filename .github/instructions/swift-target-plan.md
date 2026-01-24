@@ -12,11 +12,12 @@
 - Language wiring and CLI dispatch exist. See `src/Fable.AST/Plugins.fs`, `src/Fable.Cli/Entry.fs`, `src/Fable.Cli/Pipeline.fs`.
 - Minimal Swift AST, printer, and transform are present. See `src/Fable.Transforms/Swift/Swift.fs`, `src/Fable.Transforms/Swift/SwiftPrinter.fs`, `src/Fable.Transforms/Swift/Fable2Swift.fs`.
 - Basic control flow (if/else), subscripts, and helper emission are covered with integration tests. See `tests/Integration/Integration/CliTests.fs`.
+- Swift replacements are now wired through `Replacements.Api` and `Fable.Transforms.fsproj`, with a stub `src/Fable.Transforms/Swift/Replacements.fs`.
 - High-level TODOs tracked in `docs/swift-backend-todo.md` and feasibility notes in `docs/swift-backend-feasibility.md`.
 
 ## Missing work (summary)
 
-- Swift replacements and intrinsic mappings in `src/Fable.Transforms/Replacements.fs` and a new `src/Fable.Transforms/Swift/Replacements.fs`.
+- Expand Swift replacements beyond the current JS pass-through (strings, console, options, collections).
 - Broaden Swift AST and printer coverage (switch/loops, assignments, literals, types).
 - Expand Fable2Swift transform for more Fable expressions, statements, and patterns.
 - Add a minimal Swift runtime library and Fable.Core Swift interop surface.

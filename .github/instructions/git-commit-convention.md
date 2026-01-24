@@ -13,6 +13,13 @@ which makes it easier to write automated tools on top of.
 This convention dovetails with [SemVer](http://semver.org),
 by describing the features, fixes, and breaking changes made in commit messages.
 
+## Role in the development cycle (hierarchy)
+
+Apply this specification during the finalization step in
+`.github/instructions/step-by-step.md`. For project context, see
+`.github/instructions/codex.md`. For review formatting, see
+`.github/instructions/code-review-prompt.md`.
+
 The commit message should be structured as follows:
 
 ---

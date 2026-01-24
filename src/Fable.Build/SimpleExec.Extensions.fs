@@ -3,6 +3,26 @@ module SimpleExec
 open SimpleExec
 open BlackFox.CommandLine
 open Build.Utils
+open System
+open System.IO
+
+let private shouldUseBuiltCli () =
+    match Environment.GetEnvironmentVariable("FABLE_USE_BUILT_CLI") with
+    | null
+    | "" -> false
+    | value ->
+        match value.Trim().ToLowerInvariant() with
+        | "1"
+        | "true" -> true
+        | _ -> false
+
+let private tryGetBuiltCliPath (localFableDir: string) =
+    let dllPath = Path.Combine(localFableDir, "bin", "Release", "net10.0", "fable.dll")
+
+    if File.Exists dllPath then
+        Some dllPath
+    else
+        None
 
 type Command with
 
@@ -10,18 +30,33 @@ type Command with
         let localFableDir = __SOURCE_DIRECTORY__ </> ".." </> "Fable.Cli"
 
         let args =
-            CmdLine.concat
-                [
-                    CmdLine.empty
-                    |> CmdLine.appendRaw "run"
-                    |> CmdLine.appendPrefix "-c" "Release"
-                    |> CmdLine.appendPrefix "--project" localFableDir
-                    |> CmdLine.appendRaw "--"
-
-                    args
-
-                ]
-            |> CmdLine.toString
+            if shouldUseBuiltCli () then
+                match tryGetBuiltCliPath localFableDir with
+                | Some dllPath ->
+                    CmdLine.concat [ CmdLine.empty |> CmdLine.appendRaw "exec" |> CmdLine.appendRaw dllPath; args ]
+                    |> CmdLine.toString
+                | None ->
+                    CmdLine.concat
+                        [
+                            CmdLine.empty
+                            |> CmdLine.appendRaw "run"
+                            |> CmdLine.appendPrefix "-c" "Release"
+                            |> CmdLine.appendPrefix "--project" localFableDir
+                            |> CmdLine.appendRaw "--"
+                            args
+                        ]
+                    |> CmdLine.toString
+            else
+                CmdLine.concat
+                    [
+                        CmdLine.empty
+                        |> CmdLine.appendRaw "run"
+                        |> CmdLine.appendPrefix "-c" "Release"
+                        |> CmdLine.appendPrefix "--project" localFableDir
+                        |> CmdLine.appendRaw "--"
+                        args
+                    ]
+                |> CmdLine.toString
 
         Command.Run("dotnet", args, ?workingDirectory = workingDirectory, ?noEcho = noEcho, ?echoPrefix = echoPrefix)
 
@@ -31,13 +66,30 @@ type Command with
         let argsBuilder = defaultArg argsBuilder id
 
         let args =
-            CmdLine.empty
-            |> CmdLine.appendRaw "run"
-            |> CmdLine.appendPrefix "-c" "Release"
-            |> CmdLine.appendPrefix "--project" localFableDir
-            |> CmdLine.appendRaw "--"
-            |> argsBuilder
-            |> CmdLine.toString
+            if shouldUseBuiltCli () then
+                match tryGetBuiltCliPath localFableDir with
+                | Some dllPath ->
+                    CmdLine.empty
+                    |> CmdLine.appendRaw "exec"
+                    |> CmdLine.appendRaw dllPath
+                    |> argsBuilder
+                    |> CmdLine.toString
+                | None ->
+                    CmdLine.empty
+                    |> CmdLine.appendRaw "run"
+                    |> CmdLine.appendPrefix "-c" "Release"
+                    |> CmdLine.appendPrefix "--project" localFableDir
+                    |> CmdLine.appendRaw "--"
+                    |> argsBuilder
+                    |> CmdLine.toString
+            else
+                CmdLine.empty
+                |> CmdLine.appendRaw "run"
+                |> CmdLine.appendPrefix "-c" "Release"
+                |> CmdLine.appendPrefix "--project" localFableDir
+                |> CmdLine.appendRaw "--"
+                |> argsBuilder
+                |> CmdLine.toString
 
         Command.Run("dotnet", args, ?workingDirectory = workingDirectory, ?noEcho = noEcho, ?echoPrefix = echoPrefix)
 

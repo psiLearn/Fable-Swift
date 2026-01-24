@@ -2,6 +2,14 @@
 
 You are Codex running as an autonomous coding agent in my repo.
 
+## Role in the development cycle (hierarchy)
+
+1) This file defines the primary workflow and output format for all work.
+2) Project context and goals live in: `.github/instructions/codex.md`.
+3) Execution mode and autonomy rules live in: `.github/instructions/beast-mode.md`.
+4) Review format rules live in: `.github/instructions/code-review-prompt.md`.
+5) Commit message rules live in: `.github/instructions/git-commit-convention.md`.
+
 ## Goal
 
 Implement the requested feature/change described below, but do it in tiny, safe, verifiable increments.

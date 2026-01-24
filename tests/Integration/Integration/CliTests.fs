@@ -901,6 +901,72 @@ let tests =
         | declarations ->
             failtestf "Expected isNullOrWhiteSpace helper and call, got %A" declarations
 
+    testCase "Swift transform maps System.String.IsNullOrEmpty to helper" <| fun () ->
+        let com = makeCompiler Swift "lib"
+
+        let stringEntity: Fable.AST.Fable.EntityRef =
+            {
+                FullName = "System.String"
+                Path = Fable.AST.Fable.CoreAssemblyName "System.Runtime"
+            }
+
+        let memberInfo: Fable.AST.Fable.MemberRefInfo =
+            {
+                IsInstance = false
+                CompiledName = "IsNullOrEmpty"
+                NonCurriedArgTypes = None
+                AttributeFullNames = []
+            }
+
+        let memberRef = Fable.AST.Fable.MemberRef(stringEntity, memberInfo)
+
+        let arg: Fable.AST.Fable.Ident =
+            {
+                Name = "value"
+                Type = Fable.AST.Fable.String
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let callInfo =
+            Fable.AST.Fable.CallInfo.Create(
+                args = [ Fable.AST.Fable.IdentExpr arg ],
+                memberRef = memberRef
+            )
+
+        let calleeIdent: Fable.AST.Fable.Ident =
+            {
+                Name = "IsNullOrEmpty"
+                Type = Fable.AST.Fable.Boolean
+                IsMutable = false
+                IsThisArgument = false
+                IsCompilerGenerated = false
+                Range = None
+            }
+
+        let expr = Fable.AST.Fable.Call(Fable.AST.Fable.IdentExpr calleeIdent, callInfo, Fable.AST.Fable.Boolean, None)
+
+        let decl =
+            Fable.AST.Fable.ActionDeclaration
+                {
+                    Body = expr
+                    UsedNames = Set.empty
+                }
+
+        let file = Fable.AST.Fable.File([ decl ])
+        let swiftFile = Fable.Transforms.Swift.Fable2Swift.Compiler.transformFile com file
+
+        match swiftFile.Declarations with
+        | SwiftFuncDecl funcDecl
+            :: SwiftStatementDecl (SwiftExpr (SwiftCall(SwiftIdentifier name, _)))
+            :: _ ->
+            Expect.equal funcDecl.Name "isNullOrEmpty" "adds isNullOrEmpty helper"
+            Expect.equal name "isNullOrEmpty" "uses isNullOrEmpty call"
+        | declarations ->
+            failtestf "Expected isNullOrEmpty helper and call, got %A" declarations
+
     testCase "Swift transform keeps helpers for binary expressions" <| fun () ->
         let com = makeCompiler Swift "lib"
 
@@ -957,7 +1023,7 @@ let tests =
         let expr =
             Fable.AST.Fable.Operation(
                 Fable.AST.Fable.Logical(
-                    Fable.AST.Fable.LogicalAnd,
+                    Fable.AST.LogicalAnd,
                     callExpr,
                     Fable.AST.Fable.Value(Fable.AST.Fable.BoolConstant true, None)
                 ),

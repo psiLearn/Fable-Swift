@@ -2,6 +2,15 @@
 
 You are working inside the Fable compiler repository.
 
+## Role in the development cycle (hierarchy)
+
+This file provides project context and mission guidance. It is subordinate to the workflow rules in
+`.github/instructions/step-by-step.md` and should be used alongside:
+
+- `.github/instructions/beast-mode.md` for execution mode.
+- `.github/instructions/code-review-prompt.md` for review formatting.
+- `.github/instructions/git-commit-convention.md` for commit message structure.
+
 ## Project context
 
 - Language: F# (.NET)

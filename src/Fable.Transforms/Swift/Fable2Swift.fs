@@ -34,6 +34,8 @@ type private HelperAnalysis =
         HasStderrHelper: bool
         NeedsIsNullOrWhiteSpace: bool
         HasIsNullOrWhiteSpaceHelper: bool
+        NeedsIsNullOrEmpty: bool
+        HasIsNullOrEmptyHelper: bool
         HasFoundationImport: bool
         LastImportIndex: int option
     }
@@ -169,6 +171,8 @@ let private stderrPrintName = "stderrPrint"
 let private stderrPrintIdentifier = SwiftIdentifier stderrPrintName
 let private isNullOrWhiteSpaceName = "isNullOrWhiteSpace"
 let private isNullOrWhiteSpaceIdentifier = SwiftIdentifier isNullOrWhiteSpaceName
+let private isNullOrEmptyName = "isNullOrEmpty"
+let private isNullOrEmptyIdentifier = SwiftIdentifier isNullOrEmptyName
 
 let private tryGetPrintTarget name =
     match name with
@@ -285,6 +289,13 @@ let rec private tryTransformExpr =
             | [ arg ] ->
                 match tryTransformExpr arg with
                 | Some argExpr -> SwiftCall(isNullOrWhiteSpaceIdentifier, [ argExpr ]) |> Some
+                | None -> None
+            | _ -> None
+        elif isSystemStringMember "IsNullOrEmpty" callInfo then
+            match callInfo.Args with
+            | [ arg ] ->
+                match tryTransformExpr arg with
+                | Some argExpr -> SwiftCall(isNullOrEmptyIdentifier, [ argExpr ]) |> Some
                 | None -> None
             | _ -> None
         else
@@ -585,6 +596,9 @@ module Compiler =
                 analysis.NeedsIsNullOrWhiteSpace
                 || declarationUsesCall isNullOrWhiteSpaceName declaration
 
+            let needsIsNullOrEmpty =
+                analysis.NeedsIsNullOrEmpty || declarationUsesCall isNullOrEmptyName declaration
+
             let hasStderrHelper =
                 analysis.HasStderrHelper
                 || match declaration with
@@ -595,6 +609,12 @@ module Compiler =
                 analysis.HasIsNullOrWhiteSpaceHelper
                 || match declaration with
                    | SwiftFuncDecl funcDecl when funcDecl.Name = isNullOrWhiteSpaceName -> true
+                   | _ -> false
+
+            let hasIsNullOrEmptyHelper =
+                analysis.HasIsNullOrEmptyHelper
+                || match declaration with
+                   | SwiftFuncDecl funcDecl when funcDecl.Name = isNullOrEmptyName -> true
                    | _ -> false
 
             let hasFoundationImport =
@@ -613,6 +633,8 @@ module Compiler =
                 HasStderrHelper = hasStderrHelper
                 NeedsIsNullOrWhiteSpace = needsIsNullOrWhiteSpace
                 HasIsNullOrWhiteSpaceHelper = hasIsNullOrWhiteSpaceHelper
+                NeedsIsNullOrEmpty = needsIsNullOrEmpty
+                HasIsNullOrEmptyHelper = hasIsNullOrEmptyHelper
                 HasFoundationImport = hasFoundationImport
                 LastImportIndex = lastImportIndex
             }
@@ -627,6 +649,8 @@ module Compiler =
                     HasStderrHelper = false
                     NeedsIsNullOrWhiteSpace = false
                     HasIsNullOrWhiteSpaceHelper = false
+                    NeedsIsNullOrEmpty = false
+                    HasIsNullOrEmptyHelper = false
                     HasFoundationImport = false
                     LastImportIndex = None
                 }
@@ -661,12 +685,24 @@ module Compiler =
                     Body = helperBody
                 }
 
+        let isNullOrEmptyDecl =
+            let helperBody = [ SwiftReturn(Some(SwiftLiteral "value?.isEmpty ?? true")) ]
+
+            SwiftFuncDecl
+                {
+                    Name = isNullOrEmptyName
+                    Parameters = [ "_ value: String?" ]
+                    Body = helperBody
+                }
+
         let helperDecls =
             [
                 if analysis.NeedsStderrPrint && not analysis.HasStderrHelper then
                     stderrHelperDecl
                 if analysis.NeedsIsNullOrWhiteSpace && not analysis.HasIsNullOrWhiteSpaceHelper then
                     isNullOrWhiteSpaceDecl
+                if analysis.NeedsIsNullOrEmpty && not analysis.HasIsNullOrEmptyHelper then
+                    isNullOrEmptyDecl
             ]
 
         let needsFoundation =
